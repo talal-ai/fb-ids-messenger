@@ -1,0 +1,28 @@
+<svg width="512" height="512" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#00C6FF;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#0072FF;stop-opacity:1" />
+        </linearGradient>
+        <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+        </filter>
+    </defs>
+    <!-- Background Bubble -->
+    <path d="M20 30C20 18.9543 28.9543 10 40 10H60C71.0457 10 80 18.9543 80 30V50C80 61.0457 71.0457 70 60 70H45L25 85V70H20C8.9543 70 0 61.0457 0 50V30C0 18.9543 8.9543 10 20 10Z" 
+          fill="#1e293b" opacity="0.5" transform="translate(10, 10)"/>
+    
+    <!-- Middle Bubble -->
+    <path d="M25 35C25 23.9543 33.9543 15 45 15H65C76.0457 15 85 23.9543 85 35V55C85 66.0457 76.0457 75 65 75H50L30 90V75H25C13.9543 75 5 66.0457 5 55V35C5 23.9543 13.9543 15 25 15Z" 
+          fill="#334155" opacity="0.8" transform="translate(5, 5)"/>
+          
+    <!-- Front Main Bubble -->
+    <path d="M30 40C30 28.9543 38.9543 20 50 20H70C81.0457 20 90 28.9543 90 40V60C90 71.0457 81.0457 80 70 80H55L35 95V80H30C18.9543 80 10 71.0457 10 60V40C10 28.9543 18.9543 20 30 20Z" 
+          fill="url(#grad1)" filter="url(#glow)"/>
+    
+    <!-- Dots -->
+    <circle cx="35" cy="50" r="4" fill="white" fill-opacity="0.9"/>
+    <circle cx="50" cy="50" r="4" fill="white" fill-opacity="0.9"/>
+    <circle cx="65" cy="50" r="4" fill="white" fill-opacity="0.9"/>
+</svg>
