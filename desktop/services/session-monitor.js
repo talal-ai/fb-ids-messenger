@@ -16,7 +16,7 @@ class SessionMonitor {
      * @param {object} telegramBot - TelegramBot module
      * @param {number} intervalMs - Check interval (default: 10 minutes)
      */
-    constructor(playwrightManager, database, telegramBot, intervalMs = 600_000) {
+    constructor(playwrightManager, database, telegramBot, intervalMs = 480_000) {
         this.pm = playwrightManager;
         this.db = database;
         this.tg = telegramBot;
@@ -24,6 +24,8 @@ class SessionMonitor {
         this._timer = null;
         // Track which accounts have already been alerted to avoid spamming
         this._alertedAccounts = new Set();
+        // Track last full-reload time per account for 4-hour reload cycle
+        this._lastReload = new Map();
     }
 
     start() {
@@ -39,6 +41,14 @@ class SessionMonitor {
             clearInterval(this._timer);
             this._timer = null;
         }
+    }
+
+    /**
+     * Clear the one-shot alert flag for an account after a successful relaunch.
+     * Called from main.js watchdog on successful restart.
+     */
+    clearAlert(accountId) {
+        this._alertedAccounts.delete(accountId);
     }
 
     async _runAll() {
@@ -112,19 +122,23 @@ class SessionMonitor {
             return;
         }
 
-        // Keep-alive: verify sidebar is rendering (indicates active session)
-        try {
-            const hasSidebar = await page.evaluate(() => {
-                return document.querySelectorAll('a[href*="/messages/t/"]').length > 0;
-            });
+        // Active heartbeat: full reload every 4 hours, mouse signal every 8 min
+        const lastReload = this._lastReload.get(acc.id) || 0;
+        const hoursSinceReload = (Date.now() - lastReload) / 3_600_000;
 
-            if (!hasSidebar) {
-                console.log(`[SessionMonitor] ${acc.id} sidebar empty, refreshing...`);
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        if (hoursSinceReload >= 4) {
+            console.log(`[SessionMonitor] 4h reload for ${acc.id}`);
+            try {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
+                this._lastReload.set(acc.id, Date.now());
+            } catch (err) {
+                console.warn(`[SessionMonitor] Reload failed for ${acc.id}:`, err.message);
             }
-        } catch (err) {
-            // Page may be navigating — not critical
-            console.warn(`[SessionMonitor] Sidebar check failed for ${acc.id}:`, err.message);
+        } else {
+            // Mouse activity signal — keeps session warm without risky XHR calls
+            try {
+                await page.mouse.move(640 + Math.random() * 100, 400 + Math.random() * 50);
+            } catch (_) { /* page navigating — harmless */ }
         }
     }
 }

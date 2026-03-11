@@ -4,6 +4,33 @@ const path = require('path');
 const { app } = require('electron');
 const { applyPlaywrightStealth, getRandomUserAgent } = require('./stealth-service');
 
+// ─── Launch arg sets ──────────────────────────────────────────────────────────
+// Base flags applied to ALL contexts (headless and visible)
+const LEAN_ARGS_BASE = [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-infobars',
+    '--disable-background-networking',       // Stop background sync draining CPU
+    '--disable-background-timer-throttling', // Keep JS timers accurate
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-extensions',
+    '--disable-translate',
+    '--disable-spell-check',
+    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--memory-pressure-off',
+];
+
+// Extra flags only for headless (monitoring) contexts — not safe for visible login
+const LEAN_ARGS_HEADLESS_ONLY = [
+    '--disable-gpu',                         // No GPU needed for headless monitoring
+    '--disable-dev-shm-usage',               // Prevent /dev/shm OOM on Linux
+    '--blink-settings=imagesEnabled=false',  // No images needed — text detection only (huge RAM saving)
+    '--js-flags=--max-old-space-size=256',   // Cap V8 heap at 256 MB (default is 1.5 GB)
+];
+
 class PlaywrightManager {
     constructor() {
         this.contexts = new Map(); // accountId -> BrowserContext
@@ -30,15 +57,16 @@ class PlaywrightManager {
         const profileDir = path.join(this.userDataRoot, accountId);
         console.log(`[Playwright] Launching ${accountId} (headless=${headless})`);
 
+        // Headless gets full lean flag set; visible gets only base (images + GPU needed for login)
+        const args = headless
+            ? [...LEAN_ARGS_BASE, ...LEAN_ARGS_HEADLESS_ONLY]
+            : LEAN_ARGS_BASE;
+
         const launchOptions = {
             headless: headless,
             viewport: { width: 1280, height: 800 },
             userAgent: getRandomUserAgent(),
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-infobars'
-            ]
+            args,
         };
 
         let context;

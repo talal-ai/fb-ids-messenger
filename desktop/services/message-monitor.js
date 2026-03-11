@@ -1,10 +1,12 @@
-﻿
+
 const Database = require('../db/database');
+const PollScheduler = require('./poll-scheduler');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dedup: ignore same sender+body within 30 s sliding window
 // ─────────────────────────────────────────────────────────────────────────────
 const DEDUP_MS = 30_000;
+const PENDING_TELEGRAM_TTL_MS = 5_000;
 const recentHashes = new Map();
 
 function isDuplicate(sender, body) {
@@ -22,6 +24,21 @@ function isDuplicate(sender, body) {
         recentHashes.delete(oldest);
     }
     return false;
+}
+
+/** Build a stable key for pending Telegram entries (one per logical message per account). */
+function pendingKey(accountId, senderName, body) {
+    const s = (senderName || '').trim().toLowerCase();
+    const b = (body || '').substring(0, 80).trim().toLowerCase();
+    return `${accountId}|${s}|${b}`;
+}
+
+/** Check if body matches preview (exact or substring after normalize). Prefer unread when multiple match. */
+function sidebarMatchPreview(body, entry) {
+    if (!entry || !entry.preview) return false;
+    const a = (body || '').trim().toLowerCase();
+    const p = (entry.preview || '').trim().toLowerCase();
+    return a === p || p.includes(a) || a.includes(p);
 }
 
 function isValidBody(text) {
@@ -173,7 +190,6 @@ const SIDEBAR_EXTRACT_FN = `(() => {
     return result;
 })()`;
 
-const POLL_INTERVAL_MS = 2_000;   // sidebar poll every 2 s for near-instant detection
 const INITIAL_DELAY_MS = 6_000;   // let the page render before first poll
 
 class MessageMonitor {
@@ -184,19 +200,31 @@ class MessageMonitor {
         // Tracks conversations currently being replied to: "accountId|convId" → true
         // Detection is fully suppressed for these during the send window.
         this._replyLocks = new Set();
+        // Notifications we could not send (no conversationId). Key: pendingKey(accountId, senderName, body).
+        // Value: { accountId, senderName, body, timestamp, timer }. Timer removes entry after TTL (no send).
+        this._pendingTelegram = new Map();
     }
 
     setMainWindow(win) { this._mainWindow = win; }
     setTelegramBot(bot) { this._telegramBot = bot; }
 
+    /** Remove a pending Telegram entry and cancel its TTL timer. */
+    _removePending(key) {
+        const entry = this._pendingTelegram.get(key);
+        if (entry && entry.timer) clearTimeout(entry.timer);
+        this._pendingTelegram.delete(key);
+    }
+
     /** Clean up so attach() can be called again after context swap. */
     detach(accountId) {
         const state = this.accounts.get(accountId);
         if (state) {
-            clearInterval(state.pollTimer);
+            // Cancel the initial-delay timer if it hasn't fired yet
             clearTimeout(state.initialTimer);
             this.accounts.delete(accountId);
         }
+        // Remove from central scheduler so no more polls are issued
+        PollScheduler.unregister(accountId);
         console.log(`[Monitor] Detached ${accountId}`);
     }
 
@@ -225,6 +253,7 @@ class MessageMonitor {
             preview: prev ? prev.preview : '',
             isUnread: false,
             lastSentReply: (sentText || '').trim().toLowerCase(),
+            senderName: prev ? prev.senderName : undefined,
         });
         console.log(`[Monitor] markReplied: ${accountId} / ${conversationId}`);
     }
@@ -244,7 +273,6 @@ class MessageMonitor {
             sidebarState: new Map(),
             lastTitleCount: -1,
             seeded: false,
-            pollTimer: null,
             initialTimer: null,
             _pollCount: 0,
         };
@@ -284,13 +312,14 @@ class MessageMonitor {
         });
 
         // ── Strategy 1: Node.js-side sidebar + title polling ─────────────────
-        // Wait for initial render before first poll, then start the interval
+        // Wait for initial render before first poll, then hand off to PollScheduler.
+        // PollScheduler staggers all accounts and caps concurrency at 10.
         state.initialTimer = setTimeout(() => {
+            state.initialTimer = null;
+            // Perform a single immediate poll to seed sidebar state
             this._pollSidebar(accountId).catch(() => {});
-            // Start repeating poll only after initial delay
-            state.pollTimer = setInterval(() => {
-                this._pollSidebar(accountId).catch(() => {});
-            }, POLL_INTERVAL_MS);
+            // Register with central scheduler for all subsequent polls
+            PollScheduler.register(accountId, () => this._pollSidebar(accountId));
         }, INITIAL_DELAY_MS);
     }
 
@@ -340,6 +369,49 @@ class MessageMonitor {
             }
         }
 
+        // ── Resolve pending Telegram (no-context detections): match by senderName + body/preview ─
+        // (Do this before the main loop so we have data.chats to match against; do NOT update
+        // sidebarState here — that would make prev === current in the main loop and isNew would never be true.)
+        if (this._telegramBot && this._pendingTelegram.size > 0) {
+            const db = Database.getDb();
+            const esc = (t) => (t || '').replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            for (const [key, entry] of [...this._pendingTelegram.entries()]) {
+                if (entry.accountId !== accountId) continue;
+                const senderNorm = (entry.senderName || '').trim().toLowerCase();
+                for (const chat of data.chats) {
+                    const chatSenderNorm = (chat.senderName || '').trim().toLowerCase();
+                    if (chatSenderNorm !== senderNorm) continue;
+                    if (!sidebarMatchPreview(entry.body, { preview: chat.preview })) continue;
+                    const ts = entry.timestamp || Date.now();
+                    let acc;
+                    try {
+                        acc = db.prepare('SELECT nickname, fb_name, fb_user_id FROM accounts WHERE id = ?').get(accountId);
+                    } catch (e) {
+                        acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
+                    }
+                    let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
+                    label = label.replace(/^\(\d+\+?\)\s*/, '');
+                    const fbIdPart = (acc && acc.fb_user_id) ? ` | FB ID: ${esc(String(acc.fb_user_id))}` : '';
+                    const dateStr = new Date(ts).toLocaleString();
+                    const lines = [
+                        `📩 ${esc(entry.senderName)}`,
+                        `💬 ${esc(entry.body)}`,
+                        ``,
+                        `🏪 Account: ${esc(label)}${fbIdPart} | ${esc(accountId)}`,
+                        `🕒 ${dateStr}`,
+                        `↩️ Swipe\\-reply to respond`,
+                    ].join('\n');
+                    const replyCtx = { accountId, conversationId: chat.convId, senderName: entry.senderName };
+                    this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
+                        console.error('[Monitor] Telegram notify failed (from pending):', err.message)
+                    );
+                    this._removePending(key);
+                    isDuplicate(entry.senderName, entry.body);
+                    break; // one notification per pending entry
+                }
+            }
+        }
+
         // ── Reconcile after reply: catch messages that arrived during navigation gap ─
         if (state._replySnapshot && state.seeded) {
             for (const chat of data.chats) {
@@ -368,21 +440,21 @@ class MessageMonitor {
 
             // 1. Skip detection entirely if we are actively sending to this conv
             if (this._replyLocks.has(`${accountId}|${chat.convId}`)) {
-                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply });
+                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply, senderName: chat.senderName });
                 continue;
             }
 
             // 2. Skip if the sidebar preview is an outgoing indicator Facebook shows while/after we send
             //    e.g. "Sending...", "Sending", "You: <text>"
             if (isOutgoingPreview(chat.preview)) {
-                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply });
+                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply, senderName: chat.senderName });
                 continue;
             }
 
             // 3. Skip if the preview exactly matches our last sent reply (brief moment before FB updates)
             const previewNorm = (chat.preview || '').trim().toLowerCase();
             if (lastSentReply && previewNorm === lastSentReply) {
-                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply });
+                state.sidebarState.set(chat.convId, { preview: chat.preview, isUnread: chat.isUnread, lastSentReply, senderName: chat.senderName });
                 continue;
             }
 
@@ -421,6 +493,7 @@ class MessageMonitor {
                 preview: chat.preview,
                 isUnread: chat.isUnread,
                 lastSentReply,   // carry forward until a genuinely new incoming message overwrites
+                senderName: chat.senderName,
             });
         }
 
@@ -498,7 +571,17 @@ class MessageMonitor {
 
         if (!senderName || !body) return;
         if (!isValidBody(body)) return;
-        if (isDuplicate(senderName, body)) return;
+
+        // Prefer sidebar over network: if we have a real conversationId and this message was previously
+        // added to pending (e.g. network fired first), remove from pending and proceed so we send with context.
+        const hasRealConvId = conversationId && !String(conversationId).startsWith('unknown_');
+        const key = pendingKey(accountId, senderName, body);
+        if (hasRealConvId && this._pendingTelegram.has(key)) {
+            this._removePending(key);
+            // Fall through — do not treat as duplicate
+        } else if (isDuplicate(senderName, body)) {
+            return;
+        }
 
         console.log(`[Monitor][${detectedBy}] "${body}" from "${senderName}" thread=${conversationId} account=${accountId}`);
 
@@ -537,36 +620,72 @@ class MessageMonitor {
             });
         }
 
-        // Push to Telegram
+        // Push to Telegram — only when we have a real conversation ID (never send without reply context).
         if (this._telegramBot) {
-            const acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
-            let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
-            // Clean the title if it starts with a notification count like "(20+) "
-            label = label.replace(/^\(\d+\+?\)\s*/, '');
-
-            // Clean, marketplace-friendly notification format.
-            // Users just swipe-reply to this message to respond on Facebook.
-            // Escape Markdown chars so Telegram doesn't choke on user content
             const esc = (t) => (t || '').replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            let acc;
+            try {
+                acc = db.prepare('SELECT nickname, fb_name, fb_user_id FROM accounts WHERE id = ?').get(accountId);
+            } catch (e) {
+                acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
+            }
+            let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
+            label = label.replace(/^\(\d+\+?\)\s*/, '');
+            const fbIdPart = (acc && acc.fb_user_id) ? ` | FB ID: ${esc(String(acc.fb_user_id))}` : '';
             const dateStr = new Date(ts).toLocaleString();
             const lines = [
                 `📩 ${esc(senderName)}`,
                 `💬 ${esc(body)}`,
                 ``,
-                `🏪 Account: ${esc(accountId)} | ${esc(label)}`,
+                `🏪 Account: ${esc(label)}${fbIdPart} | ${esc(accountId)}`,
                 `🕒 ${dateStr}`,
                 `↩️ Swipe\\-reply to respond`,
             ].join('\n');
 
-            // Only pass reply context when we have a real conversation ID.
-            // unknown_* IDs come from network intercepts with no thread info
-            // and cannot be navigated to — swipe-reply would silently fail.
             const isRealConvId = threadId && !threadId.startsWith('unknown_');
-            const replyCtx = isRealConvId ? { accountId, conversationId: threadId, senderName } : null;
+            let replyCtx = isRealConvId ? { accountId, conversationId: threadId, senderName } : null;
 
-            this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
-                console.error('[Monitor] Telegram notify failed:', err.message)
-            );
+            if (!isRealConvId) {
+                // Try to resolve conversationId from current sidebar state (match by senderName + body/preview).
+                const state = this.accounts.get(accountId);
+                if (state && state.sidebarState && state.sidebarState.size > 0) {
+                    const senderNorm = (senderName || '').trim().toLowerCase();
+                    let matchedConvId = null;
+                    let matchedUnread = false;
+                    for (const [convId, entry] of state.sidebarState) {
+                        const entrySender = (entry.senderName || '').trim().toLowerCase();
+                        if (entrySender !== senderNorm) continue;
+                        if (!sidebarMatchPreview(body, entry)) continue;
+                        // Prefer unread when multiple conversations match (same sender, same preview).
+                        const unread = !!entry.isUnread;
+                        if (!matchedConvId || unread) {
+                            matchedConvId = convId;
+                            matchedUnread = unread;
+                            if (unread) break;
+                        }
+                    }
+                    if (matchedConvId) {
+                        replyCtx = { accountId, conversationId: matchedConvId, senderName };
+                    }
+                }
+                if (replyCtx) {
+                    this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
+                        console.error('[Monitor] Telegram notify failed:', err.message)
+                    );
+                } else {
+                    // No match — add to pending so a later _pollSidebar can send when sidebar has the conv.
+                    if (!this._pendingTelegram.has(key)) {
+                        const timer = setTimeout(() => {
+                            this._pendingTelegram.delete(key);
+                        }, PENDING_TELEGRAM_TTL_MS);
+                        this._pendingTelegram.set(key, { accountId, senderName, body, timestamp: ts, timer });
+                    }
+                }
+            } else {
+                this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
+                    console.error('[Monitor] Telegram notify failed:', err.message)
+                );
+            }
         }
     }
 }

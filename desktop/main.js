@@ -12,6 +12,7 @@ const PlaywrightManager = require('./services/playwright-manager');
 const MessageMonitor = require('./services/message-monitor');
 const TelegramBot = require('./services/telegram-bot');
 const SessionMonitor = require('./services/session-monitor');
+const PollScheduler = require('./services/poll-scheduler');
 
 let mainWindow;
 
@@ -29,6 +30,16 @@ app.on('second-instance', () => {
 
 // Initialize DB
 Database.initDatabase();
+
+// Weekly VACUUM + ANALYZE — keeps the SQLite file compact as messages accumulate
+try {
+    const lastVacuum = store.get('last_db_vacuum') || 0;
+    if (Date.now() - lastVacuum > 7 * 24 * 60 * 60 * 1000) {
+        Database.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; ANALYZE;');
+        store.set('last_db_vacuum', Date.now());
+        console.log('[DB] Weekly VACUUM complete');
+    }
+} catch (e) { /* non-fatal */ }
 
 // One-time cleanup: remove false-positive messages (dot/trivial bodies) left by old scanner
 try {
@@ -96,10 +107,15 @@ app.whenReady().then(() => {
     // Restore accounts in the background — do NOT await so the window opens immediately
     (async () => {
         const accounts = Database.getDb().prepare('SELECT * FROM accounts').all();
-        for (const acc of accounts) {
+
+        // ── Batched launch: 5 accounts at a time to avoid 30-simultaneous-spawn disk/CPU spike
+        const LAUNCH_BATCH_SIZE = 5;
+        const LAUNCH_BATCH_DELAY_MS = 2000;
+
+        async function restoreAccount(acc) {
             console.log(`[Main] Restoring session for ${acc.id}`);
             try {
-                const context = await PlaywrightManager.launchAccount(acc.id, true);
+                await PlaywrightManager.launchAccount(acc.id, true);
                 const page = await PlaywrightManager.getMessengerPage(acc.id);
                 await MessageMonitor.attach(page, acc.id);
 
@@ -123,14 +139,34 @@ app.whenReady().then(() => {
                 Database.getDb().prepare('UPDATE accounts SET status = ? WHERE id = ?').run('offline', acc.id);
             }
         }
+
+        for (let i = 0; i < accounts.length; i += LAUNCH_BATCH_SIZE) {
+            const batch = accounts.slice(i, i + LAUNCH_BATCH_SIZE);
+            console.log(`[Main] Launching batch ${Math.floor(i / LAUNCH_BATCH_SIZE) + 1}: accounts ${i + 1}-${Math.min(i + LAUNCH_BATCH_SIZE, accounts.length)} of ${accounts.length}`);
+            await Promise.all(batch.map(acc => restoreAccount(acc)));
+            // Brief pause between batches to avoid I/O spike
+            if (i + LAUNCH_BATCH_SIZE < accounts.length) {
+                await new Promise(r => setTimeout(r, LAUNCH_BATCH_DELAY_MS));
+            }
+        }
+
+        // Recover any replies that were pending when the app last shut down / crashed
+        const ReplyService = require('./services/reply-service');
+        await ReplyService.recoverPendingReplies();
     })();
 
-    // Start session health monitor (checks every 10 min for expired sessions)
+    // Start poll scheduler (central staggered polling for all accounts)
+    PollScheduler.start();
+
+    // Start session health monitor (checks every 8 min for expired sessions + heartbeat)
     const sessionMonitor = new SessionMonitor(PlaywrightManager, Database, TelegramBot);
     sessionMonitor.start();
+    // Expose so watchdog can clear alerts on successful relaunch
+    app._sessionMonitor = sessionMonitor;
 });
 
 app.on('window-all-closed', async () => {
+    PollScheduler.stop();
     await PlaywrightManager.closeAll();
     if (process.platform !== 'darwin') app.quit();
 });
@@ -162,6 +198,8 @@ async function launchHeadlessWithRetry(accountId) {
                 Database.getDb().prepare('UPDATE accounts SET status = ? WHERE id = ?').run('needs_login', accountId);
             }
             if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('accounts-updated');
+            // Clear the session-expiry alert flag so future expiry re-alerts properly
+            if (app._sessionMonitor) app._sessionMonitor.clearAlert(accountId);
             console.log(`[Main] Headless launch SUCCESS for ${accountId} on attempt ${attempt}`);
             return true;
         } catch (err) {
@@ -188,7 +226,16 @@ setInterval(async () => {
         const accounts = Database.getDb().prepare("SELECT * FROM accounts WHERE status = 'active'").all();
         for (const acc of accounts) {
             if (!PlaywrightManager.hasContext(acc.id)) {
-                console.warn(`[Watchdog] Account ${acc.id} is marked active but has no browser context! Relaunching...`);
+                const label = acc.fb_name || acc.nickname || acc.id;
+                console.warn(`[Watchdog] Account ${acc.id} (${label}) has no browser context — alerting + relaunching...`);
+                // Notify operator via Telegram so they know a recovery is happening
+                try {
+                    const esc = (t) => (t || '').replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+                    TelegramBot.sendNotification(
+                        `🔄 *Auto\\-Recovery*\n\nAccount: ${esc(label)} \\(${esc(acc.id)}\\)\nBrowser context was lost\\. Relaunching now\\.`,
+                        null
+                    ).catch(() => {});
+                } catch (_) {}
                 await launchHeadlessWithRetry(acc.id);
             }
         }

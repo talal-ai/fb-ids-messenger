@@ -103,39 +103,39 @@ export default function TelegramSettings() {
     };
 
     return (
-        <div className="p-8 max-w-4xl mx-auto">
-            <div className="bg-slate-800/50 backdrop-blur-md border border-white/5 rounded-3xl p-8 shadow-xl">
-                <div className="flex items-center gap-4 mb-8">
-                    <div className="p-3 bg-blue-500/20 text-blue-400 rounded-xl">
-                        <MessageCircle size={24} />
+        <div className="p-4 max-w-3xl mx-auto">
+            <div className="rounded-2xl bg-slate-900/50 backdrop-blur-sm border border-white/[0.06] p-6 shadow-glass">
+                <div className="flex items-center gap-3 mb-6">
+                    <div className="w-11 h-11 rounded-xl bg-blue-500/15 text-blue-400 flex items-center justify-center shrink-0">
+                        <MessageCircle size={22} />
                     </div>
                     <div>
-                        <h2 className="text-xl font-bold text-white">Telegram Integration</h2>
-                        <p className="text-slate-400 text-sm">Connect your bot to receive messages and reply from your phone.</p>
+                        <h2 className="text-lg font-semibold text-white">Telegram Integration</h2>
+                        <p className="text-slate-500 text-sm mt-0.5">Connect your bot to receive and reply from your phone</p>
                     </div>
                 </div>
 
-                <div className="space-y-6">
+                <div className="space-y-5">
                     <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-2">Bot Token</label>
-                        <input 
-                            type="text" 
-                            className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                        <label className="block text-sm font-medium text-slate-300 mb-1.5">Bot Token</label>
+                        <input
+                            type="text"
+                            className="w-full bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-colors"
                             placeholder="123456789:ABCdefGhIcF..."
                             value={token}
                             onChange={(e) => setToken(e.target.value)}
                         />
-                        <p className="mt-2 text-xs text-slate-500 flex items-center gap-1">
+                        <p className="mt-1.5 text-xs text-slate-500 flex items-center gap-1">
                             <Info size={12} /> Get this from @BotFather
                         </p>
                     </div>
 
                     <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-2">Chat ID</label>
-                        <div className="flex gap-2">
-                            <input 
-                                type="text" 
-                                className="flex-1 bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                        <label className="block text-sm font-medium text-slate-300 mb-1.5">Chat ID</label>
+                        <div className="flex gap-2 flex-wrap">
+                            <input
+                                type="text"
+                                className="flex-1 min-w-[140px] bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-colors"
                                 placeholder="123456789"
                                 value={chatId}
                                 onChange={(e) => setChatId(e.target.value)}
@@ -157,110 +157,98 @@ export default function TelegramSettings() {
                                     }
                                     setTimeout(() => setTestStatus({ msg: '', type: '' }), 8000);
                                 }}
-                                className="px-4 py-3 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-xl flex items-center gap-2 transition-all text-sm font-medium whitespace-nowrap"
+                                className="px-4 py-2.5 bg-slate-700/80 hover:bg-slate-600 text-slate-200 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors focus-ring"
                                 title="Auto-detect chat ID from recent messages"
                             >
                                 <Search size={16} />
                                 Detect
                             </button>
                         </div>
-                         <p className="mt-2 text-xs text-slate-500 flex items-center gap-1">
-                            <Info size={12} /> Send /start to your bot, then click Detect — or get manually from @userinfobot
+                        <p className="mt-1.5 text-xs text-slate-500 flex items-center gap-1">
+                            <Info size={12} /> Send /start to your bot, then Detect — or get from @userinfobot
                         </p>
                     </div>
 
-                    <div className="pt-4 border-t border-white/5">
-                        <div className="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 className="text-sm font-medium text-slate-300">Connection Options</h3>
-                                <p className="text-xs text-slate-500">Enable if you have connection issues.</p>
-                            </div>
-                        </div>
-
-                        <div className="mt-2 space-y-4 bg-slate-900/30 p-4 rounded-xl border border-white/5">
-                            <label className="block text-sm font-medium text-slate-300">Manual Proxy</label>
-                            
-                            <div className="flex gap-4">
-                                <div className="w-1/4">
+                    <div className="pt-5 border-t border-white/[0.06]">
+                        <h3 className="text-sm font-medium text-slate-300 mb-1">Connection options</h3>
+                        <p className="text-xs text-slate-500 mb-3">Use if you have connection issues</p>
+                        <div className="space-y-4 rounded-xl bg-slate-800/40 p-4 border border-white/[0.04]">
+                            <label className="block text-sm font-medium text-slate-300">Manual proxy</label>
+                            <div className="flex flex-wrap gap-3">
+                                <div className="w-24">
                                     <label className="block text-xs text-slate-500 mb-1">Protocol</label>
-                                    <select 
+                                    <select
                                         value={proxyProtocol}
                                         onChange={(e) => setProxyProtocol(e.target.value)}
-                                        className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-3 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                                        className="w-full bg-slate-900/60 border border-white/[0.08] rounded-lg px-3 py-2.5 text-white text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                                     >
                                         <option value="http">HTTP</option>
                                         <option value="socks5">SOCKS5</option>
                                     </select>
                                 </div>
-                                <div className="flex-1">
-                                    <label className="block text-xs text-slate-500 mb-1">Host / IP</label>
-                                    <input 
-                                        type="text" 
+                                <div className="flex-1 min-w-[120px]">
+                                    <label className="block text-xs text-slate-500 mb-1">Host</label>
+                                    <input
+                                        type="text"
                                         placeholder="1.2.3.4"
                                         value={proxyHost}
                                         onChange={(e) => setProxyHost(e.target.value)}
-                                        className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                                        className="w-full bg-slate-900/60 border border-white/[0.08] rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                                     />
                                 </div>
-                                <div className="w-1/4">
+                                <div className="w-24">
                                     <label className="block text-xs text-slate-500 mb-1">Port</label>
-                                    <input 
-                                        type="text" 
+                                    <input
+                                        type="text"
                                         placeholder="8080"
                                         value={proxyPort}
                                         onChange={(e) => setProxyPort(e.target.value)}
-                                        className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                                        className="w-full bg-slate-900/60 border border-white/[0.08] rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                                     />
                                 </div>
-                            </div>
-
-                            <div className="flex gap-4">
-                                <div className="flex-1">
-                                    <label className="block text-xs text-slate-500 mb-1">Username (Optional)</label>
-                                    <input 
-                                        type="text" 
+                                <div className="flex-1 min-w-[120px]">
+                                    <label className="block text-xs text-slate-500 mb-1">Username (optional)</label>
+                                    <input
+                                        type="text"
                                         placeholder="user"
                                         value={proxyUser}
                                         onChange={(e) => setProxyUser(e.target.value)}
-                                        className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                                        className="w-full bg-slate-900/60 border border-white/[0.08] rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                                     />
                                 </div>
-                                <div className="flex-1">
-                                    <label className="block text-xs text-slate-500 mb-1">Password (Optional)</label>
-                                    <input 
-                                        type="password" 
-                                        placeholder="pass"
+                                <div className="flex-1 min-w-[120px]">
+                                    <label className="block text-xs text-slate-500 mb-1">Password (optional)</label>
+                                    <input
+                                        type="password"
+                                        placeholder="••••"
                                         value={proxyPass}
                                         onChange={(e) => setProxyPass(e.target.value)}
-                                        className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
+                                        className="w-full bg-slate-900/60 border border-white/[0.08] rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                                     />
                                 </div>
                             </div>
                         </div>
                     </div>
 
-                    <div className="flex gap-4">
-                        <span className="text-xs text-slate-400 self-center">(auto-saved from your last bot conversation)</span>
-                        <button 
+                    <div className="flex flex-wrap items-center gap-3 pt-2">
+                        <button
                             onClick={handleSave}
-                            className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95"
+                            className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-xl flex items-center gap-2 transition-colors focus-ring"
                         >
                             <Save size={18} />
-                            Save Configuration
+                            Save
                         </button>
-
                         <button
                             onClick={handleTest}
                             disabled={testStatus.type === 'loading'}
-                            className="px-6 py-3 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 font-semibold rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95 border border-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="px-4 py-2.5 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 text-sm font-medium rounded-xl flex items-center gap-2 border border-emerald-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus-ring"
                         >
-                            <Send size={18} />
+                            <Send size={16} />
                             Test
                         </button>
-                        
-                        <button 
+                        <button
                             onClick={async () => {
-                                if (window.api && confirm('Are you sure you want to reset all Telegram settings?')) {
+                                if (window.api && confirm('Reset all Telegram settings?')) {
                                     await window.api.invoke('settings:reset-telegram');
                                     setToken('');
                                     setChatId('');
@@ -268,40 +256,39 @@ export default function TelegramSettings() {
                                     setProxyPort('');
                                     setProxyUser('');
                                     setProxyPass('');
-                                    setStatus('Settings reset successfully.');
+                                    setStatus('Settings reset.');
                                 }
                             }}
-                            className="px-6 py-3 bg-red-500/10 hover:bg-red-500/20 text-red-500 font-semibold rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95 border border-red-500/20"
+                            className="px-4 py-2.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 text-sm font-medium rounded-xl border border-red-500/20 transition-colors focus-ring"
                         >
                             Reset
                         </button>
+                        <span className="text-xs text-slate-500">Auto-saved from last bot conversation</span>
                     </div>
 
                     {status && (
-                        <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-center text-sm font-medium animate-fade-in">
+                        <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-sm font-medium animate-fade-in">
                             {status}
                         </div>
                     )}
 
                     {testStatus.msg && (
-                        <div className={`p-4 rounded-xl text-center text-sm font-medium animate-fade-in border ${
-                            testStatus.type === 'ok'
-                                ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
-                                : testStatus.type === 'err'
-                                ? 'bg-red-500/10 border-red-500/20 text-red-400'
-                                : 'bg-slate-700/50 border-white/10 text-slate-300'
+                        <div className={`p-3 rounded-xl text-sm font-medium animate-fade-in border ${
+                            testStatus.type === 'ok' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' :
+                            testStatus.type === 'err' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
+                            'bg-slate-800/50 border-white/[0.06] text-slate-300'
                         }`}>
                             {testStatus.msg}
                         </div>
                     )}
                 </div>
 
-                <div className="mt-8 pt-8 border-t border-white/5">
-                    <h3 className="text-sm font-semibold text-white mb-4">How it works</h3>
-                    <ul className="space-y-2 text-sm text-slate-400 list-disc list-inside">
-                        <li>Messages from tracked FB sessions are forwarded here.</li>
-                        <li>Reply functionality: <code>/reply &lt;account_id&gt; &lt;message&gt;</code></li>
-                        <li>Images and attachments show as links/text placeholders for now.</li>
+                <div className="mt-6 pt-6 border-t border-white/[0.06]">
+                    <h3 className="text-sm font-semibold text-white mb-2">How it works</h3>
+                    <ul className="space-y-1.5 text-sm text-slate-500 list-disc list-inside">
+                        <li>FB session messages are forwarded to this chat.</li>
+                        <li>Reply: <code className="text-slate-400 font-mono text-xs bg-slate-800/60 px-1.5 py-0.5 rounded">/reply &lt;account_id&gt; &lt;message&gt;</code></li>
+                        <li>Attachments appear as links for now.</li>
                     </ul>
                 </div>
             </div>

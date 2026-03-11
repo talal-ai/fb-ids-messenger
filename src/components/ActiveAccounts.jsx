@@ -15,91 +15,90 @@ export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAcco
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex justify-between items-center mb-6">
+    <div className="space-y-5 p-1">
+      <div className="flex flex-wrap justify-between items-center gap-4">
         <div>
-            <h3 className="text-xl font-bold text-white">Active Sessions</h3>
-            <p className="text-slate-400 text-sm">Manage your persistent FB sessions.</p>
+          <h3 className="text-lg font-semibold text-white">Active Sessions</h3>
+          <p className="text-slate-500 text-sm mt-0.5">Manage your persistent FB sessions</p>
         </div>
-        
-        <button 
-            onClick={() => setIsAdding(!isAdding)} 
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl shadow-lg shadow-blue-900/20 transition-all flex items-center gap-2"
+        <button
+          onClick={() => setIsAdding(!isAdding)}
+          className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-xl shadow-accent transition-all flex items-center gap-2 focus-ring"
         >
-            <Users size={18} />
-            {isAdding ? 'Cancel' : 'Add New Account'}
+          <Users size={18} />
+          {isAdding ? 'Cancel' : 'Add New Account'}
         </button>
       </div>
 
-      {/* Add Account Form */}
       {isAdding && (
-          <div className="bg-slate-800/50 border border-blue-500/30 rounded-2xl p-6 mb-6 animate-fade-in">
-              <h4 className="text-white font-medium mb-4">Launch New Session</h4>
-              <form onSubmit={handleSubmit} className="flex gap-4">
-                  <input 
-                    type="text" 
-                    placeholder="Enter nickname (e.g. 'Personal', 'Business')" 
-                    className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-white focus:border-blue-500 focus:outline-none"
-                    value={nickname}
-                    onChange={e => setNickname(e.target.value)}
-                    autoFocus
-                  />
-                  <button type="submit" className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl">
-                      Launch Browser
-                  </button>
-              </form>
-          </div>
+        <div className="rounded-2xl bg-slate-900/50 border border-blue-500/20 p-5 animate-fade-in">
+          <h4 className="text-white font-medium text-sm mb-3">Launch New Session</h4>
+          <form onSubmit={handleSubmit} className="flex flex-wrap gap-3">
+            <input
+              type="text"
+              placeholder="Nickname (e.g. Personal, Business)"
+              className="flex-1 min-w-[200px] bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-colors"
+              value={nickname}
+              onChange={(e) => setNickname(e.target.value)}
+              autoFocus
+            />
+            <button type="submit" className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-xl transition-colors">
+              Launch Browser
+            </button>
+          </form>
+        </div>
       )}
 
-      {/* Account List */}
       {(!accounts || accounts.length === 0) ? (
-        <div className="text-center py-20 bg-slate-900/30 border border-dashed border-slate-800 rounded-3xl">
-          <Users size={48} className="mx-auto text-slate-600 mb-4" />
-          <p className="text-slate-400 font-medium">No active sessions.</p>
-          <p className="text-slate-500 text-sm mt-1">Click "Add New Account" to start.</p>
+        <div className="text-center py-16 rounded-2xl bg-slate-900/30 border border-dashed border-white/[0.08]">
+          <div className="w-14 h-14 rounded-2xl bg-slate-800/80 flex items-center justify-center mx-auto mb-4 text-slate-500">
+            <Users size={28} />
+          </div>
+          <p className="text-slate-400 font-medium">No active sessions</p>
+          <p className="text-slate-500 text-sm mt-1">Click “Add New Account” to start a session.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {accounts.map((acc) => (
-            <div key={acc.id} className="bg-slate-900/60 backdrop-blur border border-white/5 p-5 rounded-2xl hover:border-blue-500/30 transition-all group relative">
-                <div className="flex justify-between items-start mb-3">
-                    <div className="min-w-0 flex-1">
-                        <h4 className="font-bold text-white text-lg truncate">{acc.fb_name || acc.nickname || 'Session'}</h4>
-                        {acc.fb_name && acc.nickname && (
-                            <p className="text-xs text-slate-400 mt-0.5">{acc.nickname}</p>
-                        )}
-                        <p className="text-xs text-slate-500 font-mono mt-1 truncate">{acc.id}</p>
-                        {acc.fb_user_id && (
-                            <p className="text-xs text-blue-400/60 font-mono mt-0.5">FB: {acc.fb_user_id}</p>
-                        )}
-                    </div>
-                    <div className={`shrink-0 ml-2 px-2 py-1 rounded-md text-xs font-medium border flex items-center gap-1 ${
-                        acc.status === 'active' || acc.status === 'online'
-                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-                            : acc.status === 'needs_login' 
-                            ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
-                            : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
-                    }`}>
-                        <Monitor size={12} /> {acc.status || 'offline'}
-                    </div>
+            <div
+              key={acc.id}
+              className="rounded-2xl bg-slate-900/50 backdrop-blur-sm border border-white/[0.06] p-5 shadow-glass transition-all duration-200 hover:border-white/[0.08] hover:shadow-glass-hover"
+            >
+              <div className="flex justify-between items-start gap-3 mb-4">
+                <div className="min-w-0 flex-1">
+                  <h4 className="font-semibold text-white truncate">{acc.fb_name || acc.nickname || 'Session'}</h4>
+                  {acc.fb_name && acc.nickname && <p className="text-xs text-slate-500 mt-0.5 truncate">{acc.nickname}</p>}
+                  <p className="text-[11px] text-slate-600 font-mono mt-1 truncate">{acc.id}</p>
+                  {acc.fb_user_id && <p className="text-[11px] text-blue-400/70 font-mono mt-0.5 truncate">FB: {acc.fb_user_id}</p>}
                 </div>
-                
-                <div className="flex gap-2 mt-4 pt-4 border-t border-white/5">
-                    <button 
-                        onClick={() => onOpenAccount && onOpenAccount(acc.id)}
-                        className="flex-1 py-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-medium"
-                        title="Open visible browser window"
-                    >
-                        <ExternalLink size={16} /> Open
-                    </button>
-                    <button 
-                        onClick={() => onTerminateAccount(acc.id)}
-                        className="flex-1 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-500 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-medium"
-                        title="Terminate Session"
-                    >
-                        <Trash2 size={16} /> Terminate
-                    </button>
-                </div>
+                <span
+                  className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium border ${
+                    acc.status === 'active' || acc.status === 'online'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                      : acc.status === 'needs_login'
+                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                      : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
+                  }`}
+                >
+                  <Monitor size={12} /> {acc.status || 'offline'}
+                </span>
+              </div>
+              <div className="flex gap-2 pt-4 border-t border-white/[0.06]">
+                <button
+                  onClick={() => onOpenAccount?.(acc.id)}
+                  className="flex-1 py-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 transition-colors focus-ring"
+                  title="Open browser window"
+                >
+                  <ExternalLink size={14} /> Open
+                </button>
+                <button
+                  onClick={() => onTerminateAccount(acc.id)}
+                  className="flex-1 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 transition-colors focus-ring"
+                  title="Terminate session"
+                >
+                  <Trash2 size={14} /> Terminate
+                </button>
+              </div>
             </div>
           ))}
         </div>

@@ -1,83 +1,206 @@
 /**
- * Reply Service (Playwright)
- * 
- * Handles the full reply lifecycle using Playwright pages:
- *   1. Navigate to the correct conversation URL
- *   2. Wait for the textbox to appear
- *   3. Type the message with human-like delays
- *   4. Press Enter to send
- *   5. Navigate back to inbox so message detection resumes
- * 
- * Manages a per-account reply queue so rapid replies
- * don't thrash navigation on the same browser context.
+ * Reply Service (Playwright + SQLite-backed queue)
+ *
+ * Handles the full reply lifecycle:
+ *   1. Queue a reply into SQLite (survives crashes/restarts)
+ *   2. Navigate to the correct conversation URL (invisible background operation)
+ *   3. Wait for textbox, type with human-like delays, press Enter
+ *   4. Navigate back to inbox so message detection resumes
+ *   5. Mark reply as sent or failed (with retry + Telegram alert)
+ *
+ * Crash recovery: on startup, call recoverPendingReplies() to re-process
+ * any replies that were pending when the app last died.
  */
 
 const PlaywrightManager = require('./playwright-manager');
 const MessageMonitor = require('./message-monitor');
+const Database = require('../db/database');
 
-// Base URL for navigating conversations. facebook.com/messages maintains the same threads
+// Lazy-require TelegramBot to avoid circular dependency at module load time
+function getTelegramBot() {
+    return require('./telegram-bot');
+}
+
 const MESSENGER_BASE = 'https://www.facebook.com/messages';
-const NAV_TIMEOUT = 20000;       // 20s to load conversation page
-const MIN_REPLY_GAP_MS = 3000;   // Minimum 3s between replies on same account
+const NAV_TIMEOUT = 20_000;      // 20s to load conversation page
+const MIN_REPLY_GAP_MS = 3_000;  // Minimum gap between replies on same account
+const MAX_ATTEMPTS = 3;          // Retry failed replies up to 3 times
+const RETRY_BASE_MS = 10_000;    // 10s, 20s, 30s backoff
 
-// Per-account queues: accountId -> { queue: [], processing: bool }
-const accountQueues = new Map();
+// In-memory processing lock per account (not durable — just prevents concurrent sends)
+const processingLocks = new Set(); // accountId
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Queue a reply for a specific account. Replies are processed sequentially.
- * 
- * @param {string} accountId - Which account to reply from
- * @param {string} conversationId - Facebook thread ID (numeric)
- * @param {string} message - Reply text
+ * Queue a reply for a specific account. Inserts into SQLite for crash-safety,
+ * then immediately tries to process if not already running.
+ *
  * @returns {Promise<{success: boolean, reason?: string}>}
  */
 function queueReply(accountId, conversationId, message) {
-    return new Promise((resolve) => {
-        if (!accountQueues.has(accountId)) {
-            accountQueues.set(accountId, { queue: [], processing: false });
-        }
+    return new Promise((resolve, reject) => {
+        try {
+            const db = Database.getDb();
+            const now = Date.now();
+            const result = db.prepare(`
+                INSERT INTO reply_queue (account_id, conversation_id, message, status, attempts, created_at, next_attempt_at)
+                VALUES (?, ?, ?, 'pending', 0, ?, ?)
+            `).run(accountId, conversationId, message, now, now);
 
-        const entry = accountQueues.get(accountId);
-        entry.queue.push({ conversationId, message, resolve });
+            const rowId = result.lastInsertRowid;
+            console.log(`[ReplyService] Queued reply #${rowId} for ${accountId} → conv ${conversationId}`);
 
-        // Start processing if not already running
-        if (!entry.processing) {
-            processQueue(accountId);
+            // Fire-and-forget processing; caller gets result via the returned promise
+            processQueue(accountId, rowId, resolve).catch(err => {
+                console.error(`[ReplyService] processQueue error:`, err.message);
+                resolve({ success: false, reason: `queue-error: ${err.message}` });
+            });
+        } catch (err) {
+            console.error(`[ReplyService] Failed to queue reply:`, err.message);
+            resolve({ success: false, reason: `db-error: ${err.message}` });
         }
     });
 }
 
 /**
- * Process the reply queue for a specific account, one at a time.
+ * On startup: find all 'pending' rows left by a previous crash and re-process them.
+ * Call from main.js after accounts are restored.
  */
-async function processQueue(accountId) {
-    const entry = accountQueues.get(accountId);
-    if (!entry || entry.queue.length === 0) {
-        if (entry) entry.processing = false;
+async function recoverPendingReplies() {
+    try {
+        const db = Database.getDb();
+        const pending = db.prepare(`
+            SELECT DISTINCT account_id FROM reply_queue WHERE status = 'pending'
+        `).all();
+
+        if (pending.length === 0) return;
+        console.log(`[ReplyService] Recovering pending replies for ${pending.length} account(s)`);
+        for (const row of pending) {
+            processQueue(row.account_id, null, null).catch(() => {});
+        }
+    } catch (err) {
+        console.error('[ReplyService] recoverPendingReplies error:', err.message);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal queue processor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Process reply_queue for one account sequentially until empty.
+ * @param {string} accountId
+ * @param {number|null} targetRowId  — if set, resolve the promise when this row completes
+ * @param {Function|null} resolve    — promise resolve for the caller's queueReply() call
+ */
+async function processQueue(accountId, targetRowId, resolve) {
+    if (processingLocks.has(accountId)) {
+        // Already running for this account — the loop will pick up new rows naturally
+        if (resolve) {
+            // Caller is waiting — poll for their row to complete
+            _waitForRow(targetRowId, resolve);
+        }
         return;
     }
 
-    entry.processing = true;
-    const { conversationId, message, resolve } = entry.queue.shift();
-
+    processingLocks.add(accountId);
     try {
-        const result = await executeReply(accountId, conversationId, message);
-        resolve(result);
-    } catch (err) {
-        console.error(`[ReplyService] Unexpected error in queue for ${accountId}:`, err.message);
-        resolve({ success: false, reason: `unexpected: ${err.message}` });
+        while (true) {
+            const db = Database.getDb();
+            const row = db.prepare(`
+                SELECT * FROM reply_queue
+                WHERE account_id = ? AND status = 'pending' AND next_attempt_at <= ?
+                ORDER BY id ASC LIMIT 1
+            `).get(accountId, Date.now());
+
+            if (!row) break; // Queue empty (or all items are deferred)
+
+            const result = await executeReply(accountId, row.conversation_id, row.message);
+
+            if (result.success) {
+                db.prepare(`UPDATE reply_queue SET status = 'sent' WHERE id = ?`).run(row.id);
+                console.log(`[ReplyService] Reply #${row.id} sent successfully`);
+                // Resolve caller if this was their row
+                if (resolve && row.id === targetRowId) {
+                    resolve({ success: true });
+                    resolve = null;
+                }
+            } else {
+                const newAttempts = row.attempts + 1;
+                if (newAttempts >= MAX_ATTEMPTS) {
+                    db.prepare(`UPDATE reply_queue SET status = 'failed', attempts = ? WHERE id = ?`).run(newAttempts, row.id);
+                    console.error(`[ReplyService] Reply #${row.id} FAILED after ${MAX_ATTEMPTS} attempts: ${result.reason}`);
+                    // Alert operator via Telegram
+                    try {
+                        const esc = (t) => (t || '').replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+                        getTelegramBot().sendNotification(
+                            `❌ *Reply Failed*\n\nAccount: ${esc(accountId)}\nConversation: ${esc(row.conversation_id)}\nReason: ${esc(result.reason)}\nMessage: ${esc(row.message.substring(0, 80))}`,
+                            null
+                        ).catch(() => {});
+                    } catch (_) {}
+                    if (resolve && row.id === targetRowId) {
+                        resolve({ success: false, reason: result.reason });
+                        resolve = null;
+                    }
+                } else {
+                    const nextAttemptAt = Date.now() + RETRY_BASE_MS * newAttempts;
+                    db.prepare(`UPDATE reply_queue SET attempts = ?, next_attempt_at = ? WHERE id = ?`)
+                        .run(newAttempts, nextAttemptAt, row.id);
+                    console.warn(`[ReplyService] Reply #${row.id} attempt ${newAttempts} failed — retrying in ${RETRY_BASE_MS * newAttempts / 1000}s`);
+                    // Don't resolve yet — will retry on next process cycle
+                    if (resolve && row.id === targetRowId) {
+                        // Schedule a re-check after the backoff delay
+                        setTimeout(() => {
+                            processQueue(accountId, targetRowId, resolve).catch(() => {});
+                        }, RETRY_BASE_MS * newAttempts + 500);
+                        resolve = null; // Transfer ownership to the delayed call
+                    }
+                }
+            }
+
+            // Minimum gap between replies on the same account
+            await sleep(MIN_REPLY_GAP_MS);
+        }
     } finally {
-        // Always release the processing lock, even if sleep or next call throws
-        try { await sleep(MIN_REPLY_GAP_MS); } catch (_) {}
-        entry.processing = false;
-        // Process next item in queue if any
-        if (entry.queue.length > 0) processQueue(accountId);
+        processingLocks.delete(accountId);
+    }
+
+    // If caller's row was never resolved (e.g. it's a deferred retry), wait for it
+    if (resolve && targetRowId !== null) {
+        _waitForRow(targetRowId, resolve);
     }
 }
 
 /**
- * Execute a single reply: navigate → type → send → navigate back.
+ * Poll until a specific row reaches a terminal state, then resolve.
+ * Used when the queue is already processing and we need to track a specific row.
  */
+function _waitForRow(rowId, resolve) {
+    if (!rowId || !resolve) return;
+    const check = () => {
+        try {
+            const row = Database.getDb().prepare(`SELECT status, attempts FROM reply_queue WHERE id = ?`).get(rowId);
+            if (!row || row.status === 'sent') {
+                resolve({ success: true });
+            } else if (row.status === 'failed') {
+                resolve({ success: false, reason: 'max-attempts-exceeded' });
+            } else {
+                setTimeout(check, 2000); // re-check every 2s
+            }
+        } catch (_) {
+            resolve({ success: false, reason: 'db-lookup-error' });
+        }
+    };
+    setTimeout(check, 2000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core reply execution: navigate → type → send → navigate back
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function executeReply(accountId, conversationId, message) {
     const page = await PlaywrightManager.getMessengerPage(accountId);
     if (!page) {
@@ -88,20 +211,17 @@ async function executeReply(accountId, conversationId, message) {
         return { success: false, reason: `No conversationId provided for reply on ${accountId}` };
     }
 
-    // Snapshot sidebar state BEFORE navigating away so the monitor can
-    // reconcile any messages that arrived during the reply navigation gap
+    // Snapshot sidebar state BEFORE navigating so the monitor can reconcile
+    // any messages that arrived during the reply navigation gap
     try {
         const state = MessageMonitor.accounts.get(accountId);
-        if (state) {
-            state._replySnapshot = new Map(state.sidebarState);
-        }
+        if (state) state._replySnapshot = new Map(state.sidebarState);
     } catch (_) {}
 
-    // Lock detection immediately so polls during navigation don't fire spurious notifications
+    // Lock detection to prevent spurious notifications while we navigate
     try { MessageMonitor.lockReply(accountId, conversationId); } catch (_) {}
     console.log(`[ReplyService] Replying on ${accountId} to conversation ${conversationId}`);
 
-    // Candidate conversation URLs
     const convoUrls = [
         `${MESSENGER_BASE}/t/${conversationId}/`,
         `${MESSENGER_BASE}/e2ee/t/${conversationId}/`,
@@ -114,26 +234,15 @@ async function executeReply(accountId, conversationId, message) {
     for (const url of convoUrls) {
         try {
             console.log(`[ReplyService] Navigating to ${url}`);
-            // ensure we land on facebook domain so cookies apply correctly
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-            await sleep(2000); // Let React/SPA render
+            await sleep(2000);
 
-            // Check for textbox
             const textbox = await page.$('div[role="textbox"][contenteditable="true"], div[aria-label="Message"][contenteditable="true"], div[aria-label="Type a message"][contenteditable="true"]');
-            if (textbox) {
-                navigated = true;
-                console.log(`[ReplyService] Textbox found at ${url}`);
-                break;
-            }
+            if (textbox) { navigated = true; break; }
 
-            // Retry after brief wait (E2EE can be slow)
             await sleep(3000);
             const textboxRetry = await page.$('div[role="textbox"][contenteditable="true"], div[aria-label="Message"][contenteditable="true"], div[aria-label="Type a message"][contenteditable="true"]');
-            if (textboxRetry) {
-                navigated = true;
-                console.log(`[ReplyService] Textbox found (retry) at ${url}`);
-                break;
-            }
+            if (textboxRetry) { navigated = true; break; }
 
             lastError = new Error('Textbox not found on page');
         } catch (err) {
@@ -153,8 +262,6 @@ async function executeReply(accountId, conversationId, message) {
     try {
         const textbox = await page.$('div[role="textbox"][contenteditable="true"], div[aria-label="Message"][contenteditable="true"], div[aria-label="Type a message"][contenteditable="true"]');
         if (!textbox) {
-            // DOM may have changed between navigation check and now
-            console.error('[ReplyService] Textbox disappeared before click');
             safeNavigateBack(page);
             return { success: false, reason: 'textbox-disappeared' };
         }
@@ -165,10 +272,8 @@ async function executeReply(accountId, conversationId, message) {
         await page.keyboard.type(message, { delay: 40 + Math.random() * 40 });
         await sleep(500);
 
-        // Send
         await page.keyboard.press('Enter');
         console.log(`[ReplyService] Message sent on ${accountId} to ${conversationId}`);
-
         await sleep(1000);
     } catch (err) {
         console.error(`[ReplyService] Typing/sending failed:`, err.message);
@@ -177,7 +282,6 @@ async function executeReply(accountId, conversationId, message) {
     }
 
     // Mark conversation as replied in monitor so it won't re-fire the same message
-    // Pass the sent message text so the monitor can skip our own reply preview
     try { MessageMonitor.markReplied(accountId, conversationId, message); } catch (_) {}
 
     // Step 3: Navigate back to inbox so polling resumes on the sidebar
@@ -186,9 +290,6 @@ async function executeReply(accountId, conversationId, message) {
     return { success: true };
 }
 
-/**
- * Navigate back to Messenger inbox. Fire-and-forget.
- */
 async function safeNavigateBack(page) {
     try {
         await page.goto(MESSENGER_BASE, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -201,4 +302,4 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { queueReply };
+module.exports = { queueReply, recoverPendingReplies };

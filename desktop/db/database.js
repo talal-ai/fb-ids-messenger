@@ -36,6 +36,10 @@ function initDatabase() {
             db.exec('ALTER TABLE accounts ADD COLUMN fb_name TEXT');
             console.log('[DB] Migration: added fb_name column');
         }
+        if (!cols.includes('fb_user_id')) {
+            db.exec('ALTER TABLE accounts ADD COLUMN fb_user_id TEXT');
+            console.log('[DB] Migration: added fb_user_id column');
+        }
     } catch (e) {
         console.error('[DB] Migration error:', e);
     }
@@ -98,7 +102,14 @@ function initDatabase() {
         const cleaned = db.prepare('DELETE FROM reply_context WHERE created_at < ?').run(cutoff);
         if (cleaned.changes > 0) console.log(`[DB] Cleaned ${cleaned.changes} old reply context(s)`);
     } catch (e) { /* ignore */ }
-    
+
+    // Cleanup: purge sent/failed reply queue rows older than 7 days (keep pending forever)
+    try {
+        const queueCutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+        const qCleaned = db.prepare("DELETE FROM reply_queue WHERE status != 'pending' AND created_at < ?").run(queueCutoff);
+        if (qCleaned.changes > 0) console.log(`[DB] Cleaned ${qCleaned.changes} old reply queue record(s)`);
+    } catch (e) { /* reply_queue may not exist on first boot before schema runs — ignore */ }
+
     return db;
 }
 

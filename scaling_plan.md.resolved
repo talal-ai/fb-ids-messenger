@@ -1,0 +1,289 @@
+# Scaling Plan — FB-IDS-Messenger
+## Target: 20–30 accounts reliably, 30-day sessions, 30-day reply window
+
+---
+
+## On Your Question: One Browser Per Facebook Account
+
+**Yes — you are 100% correct and cannot avoid this.**
+
+Facebook uses strict session isolation:
+- Cookies (`c_user`, `xs`, `datr`) are per-browser-profile
+- If two FB accounts share the same browser profile → one logs the other out
+- Chromium **persistent profiles** is the correct approach (what we already use)
+- There is **no trick** to share one browser between two FB accounts without getting immediately logged out
+
+**The best idea instead:**
+> Use **one Chromium browser instance per account, but in ISOLATED USER DATA DIRECTORIES** — which is exactly what we do now. The optimization isn't to share browsers, it's to make each browser as lightweight as possible.
+
+To reduce memory per browser:
+- Disable GPU (`--disable-gpu`)
+- Disable images (`--blink-settings=imagesEnabled=false`)
+- Use `--js-flags=--max-old-space-size=64` to cap V8 heap
+- Disable extensions, spell check, translate, background networking
+
+With these flags, each Chromium drops from ~250MB → **~80-120MB RAM**.  
+At 20-30 accounts: **2.4-3.6 GB RAM** — feasible on a 8GB+ machine.
+
+---
+
+## Problem Analysis: What's Stopping 20-30 Accounts Today
+
+| Problem | Current State | Fix |
+|---------|---------------|-----|
+| All accounts in one process | If one crashes, all die | Worker process isolation |
+| Poll intervals stack up | 2s × 30 accounts = 60 concurrent polls | Staggered polling + concurrency cap |
+| Reply queue is in-memory | Lost on crash | `bullmq` with Redis or file-based queue |
+| Session expiry not proactively prevented | Detected only after expiry | Dedicated heartbeat per account |
+| No reconnect after FB `checkpoint` page | Account goes silent | Auto-detection + visible relaunch |
+| `accounts:open` crashes on visible relaunch | `bringToFront` race | Already fixed ✅ |
+| 30-day reply context | Now in SQLite ✅ | Nothing needed |
+
+---
+
+## Phase 1: Browser Optimization (Memory Reduction)
+**Goal: Reduce per-account RAM from ~250MB → ~80MB**
+
+### [MODIFY] [playwright-manager.js](file:///c:/Users/heyyt/Downloads/github/fb-ids-messenger/desktop/services/playwright-manager.js)
+
+Add lean launch flags to every `launchPersistentContext` call:
+```javascript
+const LEAN_ARGS = [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-infobars',
+    '--disable-gpu',                        // No GPU needed for headless monitoring
+    '--disable-dev-shm-usage',              // Prevent /dev/shm OOM crashes
+    '--disable-background-networking',       // Stop background sync draining CPU
+    '--disable-background-timer-throttling', // Keep JS timers on time
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-extensions',
+    '--disable-translate',
+    '--disable-spell-check',
+    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--memory-pressure-off',
+    '--blink-settings=imagesEnabled=false',  // Disable image loading (huge savings)
+    '--js-flags=--max-old-space-size=96',   // Cap V8 heap at 96MB per browser
+];
+```
+
+> [!IMPORTANT]
+> `imagesEnabled=false` means profile pictures won't load in the browser, but the Messenger sidebar TEXT (sender name, preview) still loads fine. Message detection is entirely text-based so this is safe.
+
+---
+
+## Phase 2: Staggered Polling with Concurrency Cap
+**Goal: Prevent 30 simultaneous polls from spiking CPU**
+
+### [NEW] `desktop/services/poll-scheduler.js`
+
+Instead of every account polling on its own 2s interval simultaneously, a central scheduler staggers them:
+
+```
+Account 1: poll at t=0s, t=2s, t=4s...
+Account 2: poll at t=67ms, t=2067ms...  (stagger = 2000ms / 30 accounts = 67ms apart)
+Account 3: poll at t=133ms...
+```
+
+Uses `p-limit` (free: `npm i p-limit`) to cap concurrent polls at 10 at any time:
+```javascript
+const pLimit = require('p-limit');
+const limit = pLimit(10); // max 10 concurrent Playwright evaluations
+```
+
+### [MODIFY] [message-monitor.js](file:///c:/Users/heyyt/Downloads/github/fb-ids-messenger/desktop/services/message-monitor.js)
+- Export an `attachWithScheduler(page, accountId, scheduler)` function
+- Scheduler calls poll functions in staggered order instead of each account using its own `setInterval`
+
+---
+
+## Phase 3: Process-Level Isolation (Crash Protection)
+**Goal: One account crash doesn't kill all accounts**
+
+### Architecture: AccountWorker per-account child processes
+
+```
+main.js (orchestrator)
+  ├── AccountWorker (child_process): acc_001
+  ├── AccountWorker (child_process): acc_002
+  ├── AccountWorker (child_process): acc_003
+  ...
+  └── TelegramBot (main process, handles all replies)
+```
+
+Each worker:
+- Manages exactly 1 Playwright browser
+- Sends `new-message` events to parent via `process.send()`
+- Restarts automatically if it crashes (via `cluster` or `child_process` with respawn logic)
+- Main process collects all events and forwards to Telegram
+
+**Libraries:**
+- Node.js built-in `child_process` — spawn workers (free, built-in)
+- `pino` — structured logging per worker (free: `npm i pino`)
+
+### [NEW] `desktop/workers/account-worker.js`
+```javascript
+// Runs as a child process. Manages one FB account.
+// Reports messages back to parent with process.send()
+const accountId = process.env.ACCOUNT_ID;
+// ... init playwright, message monitor, heartbeat
+process.on('message', (msg) => {
+    if (msg.type === 'reply') handleReply(msg);
+});
+```
+
+### [MODIFY] [desktop/main.js](file:///c:/Users/heyyt/Downloads/github/fb-ids-messenger/desktop/main.js)
+- Spawn workers instead of in-process account management
+- Respawn crashed workers with exponential backoff
+
+---
+
+## Phase 4: Persistent Reply Queue (Survive Crashes)
+**Goal: Replies queued for delivery survive app restarts**
+
+### Option A: File-based queue (simplest, no extra services)
+Use `better-queue` (free: `npm i better-queue`):
+```javascript
+const Queue = require('better-queue');
+const replyQueue = new Queue(async (task, cb) => {
+    await executeReply(task);
+    cb(null);
+}, {
+    store: { type: 'sqlite', path: './queue.db' }, // persists to disk
+    concurrent: 1, // one reply per account at a time
+    retries: 3,
+    retryDelay: 5000
+});
+```
+
+### Option B: bullmq + Redis (if you have Redis installed)
+More powerful — distributed, retry policies, dead-letter queue, dashboard UI:
+```javascript
+const { Queue, Worker } = require('bullmq');
+const replyQueue = new Queue('replies', { connection: redisClient });
+```
+
+**Recommendation: Start with Option A (no dependencies), upgrade to Option B when scaling beyond 30 accounts.**
+
+---
+
+## Phase 5: Session Keep-Alive Heartbeat (30-Day Sessions)
+**Goal: Keep Facebook sessions alive for 30+ days without re-login**
+
+Facebook sessions expire because cookies like `xs` have a rolling expiry — they refresh on activity. A browser that stays idle for 7+ days will get its session killed.
+
+### [MODIFY] [session-monitor.js](file:///c:/Users/heyyt/Downloads/github/fb-ids-messenger/desktop/services/session-monitor.js)
+Change the keep-alive from passive sidebar check to **active heartbeat**:
+
+```javascript
+async _heartbeat(acc, page) {
+    // 1. Navigate to Messenger (refreshes rolling session cookies)
+    // Every 4 hours, do a proper page.reload() to renew session tokens
+    const hoursSinceReload = (Date.now() - (acc._lastReload || 0)) / 3600000;
+    if (hoursSinceReload > 4) {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        acc._lastReload = Date.now();
+        return;
+    }
+    
+    // 2. Every 10 min: lightweight JS evaluation (no reload needed)
+    // Just verifying FB is alive — generates a minimal activity signal
+    await page.evaluate(() => {
+        // Trigger a tiny XHR that looks like normal browser activity
+        // This refreshes the session without a full page reload
+        fetch('/ajax/webstorage/process_queue/?ajax=1', { 
+            credentials: 'include',
+            headers: { 'X-FB-Friendly-Name': 'WebStorageProcessQueue' }
+        }).catch(() => {}); // silently ignore errors
+    });
+}
+```
+
+### Session Persistence Strategy
+| Timeframe | Action | Expected Result |
+|-----------|--------|-----------------|
+| Every 10 min | Lightweight JS ping | Session tokens refreshed |
+| Every 4 hours | Page reload | Full cookie renewal |
+| Every 24 hours | Navigate away + back | Forces full session re-auth |
+| 7+ days idle | Alert user | May need re-login anyway |
+
+With this, sessions should survive **30+ days** without manual re-login, as long as Facebook doesn't force a checkpoint (2FA/suspicious activity).
+
+---
+
+## Phase 6: 30-Day Reply Window (Already Done ✅)
+
+The `reply_context` SQLite table already supports this with 30-day TTL. No changes needed.
+
+**Verification:**
+```sql
+-- Check how many reply contexts are stored
+SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM reply_context;
+
+-- Simulate a 30-day-old reply lookup
+SELECT * FROM reply_context WHERE telegram_msg_id = <old_msg_id>;
+```
+
+---
+
+## Phase 7: Smarter Health Monitoring
+**Goal: Know the exact state of each account at all times**
+
+### [NEW] `desktop/services/account-state-machine.js`
+
+Each account has one of these states with allowed transitions:
+
+```
+LAUNCHING → ACTIVE → NEEDS_LOGIN
+                   → LOST_CONNECTION → ACTIVE (after reconnect)
+                   → REPLYING → ACTIVE
+NEEDS_LOGIN → LOGGING_IN → ACTIVE
+```
+
+This replaces the loose `status` string in the DB with a validated state machine. The UI can show a proper badge per account.
+
+---
+
+## Library Recommendations
+
+| Library | Purpose | Install |
+|---------|---------|---------|
+| `p-limit` | Cap concurrent Playwright operations | `npm i p-limit` |
+| `p-queue` | Priority queue for replies (urgent vs deferred) | `npm i p-queue` |
+| `better-queue` | Persistent file-based reply queue (survives restarts) | `npm i better-queue` |
+| `pino` | Fast structured logging per worker | `npm i pino` |
+| `pino-pretty` | Human-readable log formatting in dev | `npm i -D pino-pretty` |
+| `node-cron` | Better cron-style scheduling for heartbeat, cleanup | `npm i node-cron` |
+| `electron-log` | Electron-aware log file rotation | `npm i electron-log` |
+
+*No Redis, PostgreSQL, or paid services needed for the 20-30 account target.*
+
+---
+
+## Hardware Requirements for Scale Targets
+
+| Accounts | RAM Needed | CPU Cores | Notes |
+|----------|-----------|-----------|-------|
+| 10 | 2 GB | 2 | Works on any modern laptop |
+| 20–30 | 4–6 GB | 4 | i5/Ryzen 5 + 8GB RAM machine |
+| 50–100 | 10–15 GB | 8 | Dedicated PC or small VPS |
+| 1000 | Multi-machine cluster | Many | Need worker pool + Redis architecture |
+
+---
+
+## Implementation Order
+
+```
+Phase 1: Browser optimization (lean flags)         → 3 hours  → -60% RAM
+Phase 2: Staggered polling + p-limit               → 4 hours  → stable CPU
+Phase 5: Active heartbeat (30-day sessions)        → 3 hours  → no re-logins
+Phase 4: Persistent reply queue (better-queue)     → 5 hours  → no lost replies
+Phase 7: Account state machine                     → 4 hours  → better visibility
+Phase 3: Process isolation (child_process workers) → 1-2 days → crash resilience
+```
+
+> [!NOTE]
+> The 30-day reply window is **already implemented** — reply contexts are in SQLite with 30-day TTL. You can already reply to a 30-day-old Telegram notification as long as the app hasn't been restarted more than 30 days ago.
