@@ -249,7 +249,7 @@ export default function TelegramSettings() {
                         <button
                             onClick={async () => {
                                 if (window.api && confirm('Reset all Telegram settings?')) {
-                                    await window.api.invoke('settings:reset-telegram');
+                                    await window.api.resetTelegramSettings();
                                     setToken('');
                                     setChatId('');
                                     setProxyHost('');

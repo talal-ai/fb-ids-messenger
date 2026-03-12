@@ -254,12 +254,21 @@ ipcMain.handle('accounts:list', () => {
 });
 
 ipcMain.handle('accounts:add', async (event, nickname) => {
+    if (nickname == null || typeof nickname !== 'string') {
+        return { error: 'Nickname is required' };
+    }
+    const trimmed = nickname.trim();
+    if (trimmed === '') {
+        return { error: 'Nickname cannot be empty' };
+    }
+    const nicknameToUse = trimmed.length > 64 ? trimmed.slice(0, 64) : trimmed;
+
     const id = `acc_${Date.now()}`;
     const db = Database.getDb();
-    
+
     // 1. Create DB entry (status active because we'll start a session immediately)
     db.prepare('INSERT INTO accounts (id, nickname, profile_dir, status, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(id, nickname, id, 'active', Date.now());
+      .run(id, nicknameToUse, id, 'active', Date.now());
 
     // 2. Launch Visible Window for Login
     //    We open a non-headless Playwright context so the user can authenticate manually.
@@ -308,10 +317,13 @@ ipcMain.handle('accounts:add', async (event, nickname) => {
         await launchHeadlessWithRetry(id);
     })();
 
-    return { id, nickname, status: 'active' };
+    return { id, nickname: nicknameToUse, status: 'active' };
 });
 
 ipcMain.handle('accounts:delete', async (event, accountId) => {
+    if (accountId == null || typeof accountId !== 'string' || !/^acc_\d+$/.test(accountId)) {
+        return { error: 'Invalid account ID' };
+    }
     // 1. Stop monitoring + close browser
     MessageMonitor.detach(accountId);
     await PlaywrightManager.closeAccount(accountId);
@@ -323,6 +335,8 @@ ipcMain.handle('accounts:delete', async (event, accountId) => {
     const cleanupTx = db.transaction((id) => {
         db.prepare('DELETE FROM messages WHERE account_id = ?').run(id);
         db.prepare('DELETE FROM conversations WHERE account_id = ?').run(id);
+        db.prepare('DELETE FROM reply_context WHERE account_id = ?').run(id);
+        db.prepare('DELETE FROM reply_queue WHERE account_id = ?').run(id);
         db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
     });
     cleanupTx(accountId);
@@ -332,6 +346,9 @@ ipcMain.handle('accounts:delete', async (event, accountId) => {
 });
 
 ipcMain.handle('accounts:open', async (event, accountId) => {
+    if (accountId == null || typeof accountId !== 'string' || !/^acc_\d+$/.test(accountId)) {
+        return { error: 'Invalid account ID' };
+    }
     console.log(`[Main] Opening window for ${accountId}`);
     // Detach monitoring from old headless context (will be destroyed)
     MessageMonitor.detach(accountId);

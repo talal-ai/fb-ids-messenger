@@ -142,6 +142,14 @@ class PlaywrightManager {
         this.contexts.delete(accountId);
     }
 
+    /** Get the first page for an account, or null if no context or no pages. */
+    getPage(accountId) {
+        const context = this.contexts.get(accountId);
+        if (!context || !context.pages) return null;
+        const pages = context.pages();
+        return pages.length > 0 ? pages[0] : null;
+    }
+
     /**
      * Extract logged-in Facebook user identity from a Messenger page.
      * Tries multiple strategies; returns { fbName, fbUserId } or null.
@@ -154,7 +162,7 @@ class PlaywrightManager {
             if (!page) return null;
 
             // Wait a bit for Messenger to fully render
-            await page.waitForTimeout(3000);
+            await new Promise(r => setTimeout(r, 3000));
 
             const result = await page.evaluate(() => {
                 // Strategy 1: profile settings link in sidebar

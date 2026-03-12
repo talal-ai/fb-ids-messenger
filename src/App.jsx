@@ -9,6 +9,7 @@ import TelegramSettings from './components/TelegramSettings';
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [accounts, setAccounts] = useState([]);
+  const [accountError, setAccountError] = useState(null);
 
   useEffect(() => {
     if (window.api) {
@@ -32,22 +33,34 @@ function App() {
   };
 
   const handleAddAccount = async (nickname) => {
-      if (window.api) {
-          await window.api.addAccount(nickname);
-          refreshAccounts();
+      if (!window.api) return;
+      setAccountError(null);
+      const result = await window.api.addAccount(nickname);
+      if (result?.error) {
+          setAccountError(result.error);
+          return;
       }
+      refreshAccounts();
   };
-  
+
   const handleTerminateAccount = async (id) => {
-      if (window.api) {
-          await window.api.deleteAccount(id);
-          refreshAccounts();
+      if (!window.api) return;
+      setAccountError(null);
+      const result = await window.api.deleteAccount(id);
+      if (result?.error) {
+          setAccountError(result.error);
+          return;
       }
+      refreshAccounts();
   };
 
   const handleOpenAccount = async (id) => {
-      if (window.api) {
-          await window.api.openAccount(id);
+      if (!window.api) return;
+      setAccountError(null);
+      const result = await window.api.openAccount(id);
+      if (result?.error) {
+          setAccountError(result.error);
+          return;
       }
   };
 
@@ -142,6 +155,8 @@ function App() {
               onAddAccount={handleAddAccount}
               onTerminateAccount={handleTerminateAccount}
               onOpenAccount={handleOpenAccount}
+              accountError={accountError}
+              onDismissAccountError={() => setAccountError(null)}
             />
           )}
           {activeTab === 'settings' && <TelegramSettings />}

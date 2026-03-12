@@ -11,7 +11,7 @@ contextBridge.exposeInMainWorld('api', {
     // Settings
     getSetting: (key) => ipcRenderer.invoke('settings:get', key),
     saveSetting: (key, value) => ipcRenderer.invoke('settings:save', key, value),
-    invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
+    resetTelegramSettings: () => ipcRenderer.invoke('settings:reset-telegram'),
 
 
     // Stats

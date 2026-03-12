@@ -97,7 +97,6 @@ class PollScheduler {
 
         // Count how many are currently running
         let running = 0;
-        for (const { state } of this._registry.values ? [] : []) { /* unused */ }
         for (const s of this._registry.values()) {
             if (s.running) running++;
         }

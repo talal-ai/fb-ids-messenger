@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { Users, Trash2, Monitor, ExternalLink } from 'lucide-react';
 
-export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAccount, onOpenAccount }) {
+export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAccount, onOpenAccount, accountError, onDismissAccountError }) {
   const [nickname, setNickname] = useState('');
   const [isAdding, setIsAdding] = useState(false);
 
@@ -16,6 +16,12 @@ export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAcco
 
   return (
     <div className="space-y-5 p-1">
+      {accountError && (
+        <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+          <span>{accountError}</span>
+          <button type="button" onClick={onDismissAccountError} className="shrink-0 px-2 py-1 rounded-lg hover:bg-red-500/20 transition-colors" aria-label="Dismiss">×</button>
+        </div>
+      )}
       <div className="flex flex-wrap justify-between items-center gap-4">
         <div>
           <h3 className="text-lg font-semibold text-white">Active Sessions</h3>

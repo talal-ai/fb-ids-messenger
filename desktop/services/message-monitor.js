@@ -100,7 +100,9 @@ const NOTIFICATION_INTERCEPT = `(function() {
 const SIDEBAR_EXTRACT_FN = `(() => {
     const result = { title: document.title, url: location.href, chats: [] };
 
-    // Strategy A: standard conversation links
+    // Strategy A: conversation links (both URL patterns)
+    // - /messages/t/<id>     → Marketplace, some groups, non-e2ee threads
+    // - /messages/e2ee/t/<id> → regular DMs (end-to-end encrypted)
     const links = document.querySelectorAll(
         'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]'
     );
@@ -256,6 +258,16 @@ class MessageMonitor {
             senderName: prev ? prev.senderName : undefined,
         });
         console.log(`[Monitor] markReplied: ${accountId} / ${conversationId}`);
+    }
+
+    /**
+     * Capture current sidebar state for this account so the monitor can reconcile
+     * messages that arrived during the reply navigation gap. Call before navigating
+     * to the conversation to send a reply.
+     */
+    captureReplySnapshot(accountId) {
+        const state = this.accounts.get(accountId);
+        if (state) state._replySnapshot = new Map(state.sidebarState);
     }
 
     /**

@@ -214,8 +214,7 @@ async function executeReply(accountId, conversationId, message) {
     // Snapshot sidebar state BEFORE navigating so the monitor can reconcile
     // any messages that arrived during the reply navigation gap
     try {
-        const state = MessageMonitor.accounts.get(accountId);
-        if (state) state._replySnapshot = new Map(state.sidebarState);
+        MessageMonitor.captureReplySnapshot(accountId);
     } catch (_) {}
 
     // Lock detection to prevent spurious notifications while we navigate

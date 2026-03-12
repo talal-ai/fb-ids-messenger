@@ -82,7 +82,7 @@ function sendTelegramApiMessage(token, targetChatId, text, agent) {
             parse_mode: 'Markdown'
         });
 
-        console.log(`[Telegram] sendMessage → chat_id=${chatIdValue} (${typeof chatIdValue})`);
+        console.log('[Telegram] sendMessage → chat_id present, type=', typeof chatIdValue);
 
         const options = {
             method: 'POST',

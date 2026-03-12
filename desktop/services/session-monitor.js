@@ -77,9 +77,8 @@ class SessionMonitor {
 
         let page;
         try {
-            const context = this.pm.contexts.get(acc.id);
-            if (!context || context.pages().length === 0) return;
-            page = context.pages()[0];
+            page = this.pm.getPage(acc.id);
+            if (!page) return;
         } catch (err) {
             return;
         }
