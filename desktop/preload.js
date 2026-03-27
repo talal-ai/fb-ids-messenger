@@ -25,5 +25,19 @@ contextBridge.exposeInMainWorld('api', {
 
     // Telegram test
     testTelegram: () => ipcRenderer.invoke('telegram:test'),
-    detectTelegramChat: () => ipcRenderer.invoke('telegram:detect-chat')
+    detectTelegramChat: () => ipcRenderer.invoke('telegram:detect-chat'),
+
+    // App metadata
+    getAppVersion: () => ipcRenderer.invoke('app:version'),
+
+    // Auto updater
+    getUpdaterState: () => ipcRenderer.invoke('updater:get-state'),
+    checkForUpdates: () => ipcRenderer.invoke('updater:check'),
+    downloadUpdate: () => ipcRenderer.invoke('updater:download'),
+    installUpdate: () => ipcRenderer.invoke('updater:install'),
+    onUpdaterState: (callback) => {
+        const listener = (_event, payload) => callback(payload);
+        ipcRenderer.on('updater:state', listener);
+        return () => ipcRenderer.removeListener('updater:state', listener);
+    }
 });

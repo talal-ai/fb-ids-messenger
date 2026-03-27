@@ -4,7 +4,7 @@
  * Periodically checks each active Facebook account:
  *   1. Is the page still on facebook.com/messages?
  *   2. Has the session expired (redirect to /login or /checkpoint)?
- *   3. Soft-refreshes the page to prevent cookie/session expiry.
+ *   3. Keeps session warm with low-impact heartbeat (avoids aggressive reloads).
  *
  * Alerts the user via Telegram when sessions expire.
  */
@@ -24,7 +24,7 @@ class SessionMonitor {
         this._timer = null;
         // Track which accounts have already been alerted to avoid spamming
         this._alertedAccounts = new Set();
-        // Track last full-reload time per account for 4-hour reload cycle
+        // Track last soft-health refresh time per account (rare fallback only)
         this._lastReload = new Map();
     }
 
@@ -121,12 +121,14 @@ class SessionMonitor {
             return;
         }
 
-        // Active heartbeat: full reload every 4 hours, mouse signal every 8 min
+        // Active heartbeat: mouse signal every cycle; very rare soft reload fallback.
         const lastReload = this._lastReload.get(acc.id) || 0;
         const hoursSinceReload = (Date.now() - lastReload) / 3_600_000;
 
-        if (hoursSinceReload >= 4) {
-            console.log(`[SessionMonitor] 4h reload for ${acc.id}`);
+        // Avoid frequent forced reloads; they can trigger FB anti-abuse checks.
+        // Only do a rare fallback refresh every 24h if page appears healthy.
+        if (hoursSinceReload >= 24) {
+            console.log(`[SessionMonitor] 24h soft reload for ${acc.id}`);
             try {
                 await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
                 this._lastReload.set(acc.id, Date.now());

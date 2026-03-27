@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { Activity, Users, Smartphone } from 'lucide-react';
+import { Activity, Users, Smartphone, RefreshCw, Download, RotateCcw } from 'lucide-react';
 import Logo from './components/Logo';
 import Dashboard from './components/Dashboard';
 import ActiveAccounts from './components/ActiveAccounts';
@@ -10,6 +10,15 @@ function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [accounts, setAccounts] = useState([]);
   const [accountError, setAccountError] = useState(null);
+  const [appVersion, setAppVersion] = useState('0.0.0');
+  const [updater, setUpdater] = useState({
+    status: 'idle',
+    message: 'Idle',
+    updateInfo: null,
+    progress: null,
+    checkedAt: null,
+    error: null
+  });
 
   useEffect(() => {
     if (window.api) {
@@ -18,10 +27,24 @@ function App() {
         setAccounts(accs || []);
       });
 
+      window.api.getAppVersion().then((version) => setAppVersion(version || '0.0.0'));
+
+      window.api.getUpdaterState().then((state) => {
+        if (state) setUpdater(state);
+      });
+
+      const unsubscribeUpdater = window.api.onUpdaterState((state) => {
+        if (state) setUpdater(state);
+      });
+
       // Refresh account list when identity is detected in background
       window.api.onAccountsUpdated(() => {
          window.api.getAccounts().then((accs) => setAccounts(accs || []));
       });
+
+      return () => {
+        if (typeof unsubscribeUpdater === 'function') unsubscribeUpdater();
+      };
     }
   }, []);
 
@@ -62,6 +85,39 @@ function App() {
           setAccountError(result.error);
           return;
       }
+  };
+
+  const formatBytes = (bytes) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  };
+
+  const formatSpeed = (bytesPerSecond) => {
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '0 B/s';
+    return `${formatBytes(bytesPerSecond)}/s`;
+  };
+
+  const isChecking = updater.status === 'checking';
+  const isDownloading = updater.status === 'downloading';
+  const canDownload = updater.status === 'available';
+  const canRestart = updater.status === 'downloaded';
+  const progressPercent = Number.isFinite(updater.progress?.percent) ? updater.progress.percent : 0;
+
+  const handleCheckUpdates = async () => {
+    if (!window.api) return;
+    await window.api.checkForUpdates();
+  };
+
+  const handleDownloadUpdate = async () => {
+    if (!window.api) return;
+    await window.api.downloadUpdate();
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!window.api) return;
+    await window.api.installUpdate();
   };
 
   return (
@@ -108,6 +164,15 @@ function App() {
                 )}
               </button>
             ))}
+
+            <button
+              onClick={handleCheckUpdates}
+              disabled={isChecking || isDownloading}
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all duration-200 group relative text-slate-400 hover:bg-white/[0.06] hover:text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw className={`w-5 h-5 shrink-0 ${isChecking ? 'animate-spin' : ''}`} strokeWidth={2} />
+              <span className="hidden lg:block font-medium text-sm truncate">Check Updates</span>
+            </button>
           </nav>
 
           <div className="p-3 border-t border-white/[0.06]">
@@ -117,7 +182,7 @@ function App() {
               </div>
               <div className="hidden lg:block min-w-0">
                 <div className="text-xs font-medium text-slate-200 truncate">System Online</div>
-                <div className="text-[10px] text-emerald-500/90 font-mono">v2.0.0</div>
+                <div className="text-[10px] text-emerald-500/90 font-mono">v{appVersion}</div>
               </div>
             </div>
           </div>
@@ -161,6 +226,60 @@ function App() {
           )}
           {activeTab === 'settings' && <TelegramSettings />}
         </main>
+
+        <footer className="mx-2 mt-2 shrink-0 rounded-2xl bg-slate-900/40 backdrop-blur-xl border border-white/[0.06] shadow-glass px-4 py-3">
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-slate-200 truncate">Updater</p>
+                <p className="text-[11px] text-slate-400 truncate">{updater.message || 'Idle'}</p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {canDownload && (
+                  <button
+                    onClick={handleDownloadUpdate}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download Update
+                  </button>
+                )}
+                {canRestart && (
+                  <button
+                    onClick={handleInstallUpdate}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition-colors"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    Restart & Install
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {isDownloading && (
+              <>
+                <div className="h-2 rounded-full bg-slate-800 overflow-hidden border border-white/[0.05]">
+                  <div
+                    className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-300"
+                    style={{ width: `${Math.max(0, Math.min(100, progressPercent))}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+                  <span>{progressPercent.toFixed(1)}%</span>
+                  <span>{formatSpeed(updater.progress?.bytesPerSecond)}</span>
+                  <span>
+                    {formatBytes(updater.progress?.transferred)} / {formatBytes(updater.progress?.total)}
+                  </span>
+                </div>
+              </>
+            )}
+
+            {updater.status === 'error' && (
+              <p className="text-[11px] text-rose-400 truncate">{updater.error || 'Update failed'}</p>
+            )}
+          </div>
+        </footer>
       </div>
     </div>
   );

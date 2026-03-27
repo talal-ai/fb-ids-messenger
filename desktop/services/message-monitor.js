@@ -1,16 +1,20 @@
 
 const Database = require('../db/database');
 const PollScheduler = require('./poll-scheduler');
+const crypto = require('crypto');
+const NotificationOutbox = require('./notification-outbox');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dedup: ignore same sender+body within 30 s sliding window
 // ─────────────────────────────────────────────────────────────────────────────
 const DEDUP_MS = 30_000;
-const PENDING_TELEGRAM_TTL_MS = 5_000;
+const PENDING_TELEGRAM_TTL_MS = 60_000;  // 60s — enough for a slow PollScheduler cycle with 30+ accounts
+const NETWORK_RESPONSE_MAX_BYTES = 512 * 1024; // 512 KB — skip large GraphQL payloads (history loads etc.)
 const recentHashes = new Map();
 
-function isDuplicate(sender, body) {
-    const k = `${(sender || '').toLowerCase().trim()}|${(body || '').substring(0, 80).toLowerCase().trim()}`;
+function isDuplicate(sender, body, accountId) {
+    // Key is scoped per-account so same message on different accounts are never suppressed
+    const k = `${accountId || ''}|${(sender || '').toLowerCase().trim()}|${(body || '').substring(0, 80).toLowerCase().trim()}`;
     const now = Date.now();
     const lastSeen = recentHashes.get(k);
     if (lastSeen && (now - lastSeen) < DEDUP_MS) return true;
@@ -57,6 +61,20 @@ function isOutgoingPreview(text) {
     // "You: <message>" prefix — our outgoing message in the sidebar
     if (t.startsWith('you:') || t.startsWith('you ')) return true;
     return false;
+}
+
+/**
+ * Build a deterministic event key so multiple detection strategies
+ * (sidebar/network/notification) collapse to one logical inbound event.
+ */
+function buildEventKey(accountId, conversationId, senderName, body, ts) {
+    const conv = conversationId || 'unknown';
+    const sender = (senderName || '').trim().toLowerCase();
+    const msg = (body || '').trim().toLowerCase();
+    // 5s time bucket balances cross-strategy dedup without suppressing true repeats.
+    const bucket = Math.floor((ts || Date.now()) / 5000);
+    const raw = `${accountId}|${conv}|${sender}|${msg}|${bucket}`;
+    return crypto.createHash('sha1').update(raw).digest('hex');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,7 +336,11 @@ class MessageMonitor {
                 if (!url.includes('/api/graphql') && !url.includes('graphql')) return;
                 const ct = response.headers()['content-type'] || '';
                 if (!ct.includes('json') && !ct.includes('text')) return;
+                // Skip large responses (e.g. full conversation history loads — can be several MB)
+                const cl = parseInt(response.headers()['content-length'] || '0', 10);
+                if (cl > NETWORK_RESPONSE_MAX_BYTES) return;
                 const text = await response.text();
+                if (text.length > NETWORK_RESPONSE_MAX_BYTES) return; // double-guard for chunked
                 this._parseNetworkPayload(accountId, text);
             } catch (_) {}
         });
@@ -386,7 +408,6 @@ class MessageMonitor {
         // sidebarState here — that would make prev === current in the main loop and isNew would never be true.)
         if (this._telegramBot && this._pendingTelegram.size > 0) {
             const db = Database.getDb();
-            const esc = (t) => (t || '').replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
             for (const [key, entry] of [...this._pendingTelegram.entries()]) {
                 if (entry.accountId !== accountId) continue;
                 const senderNorm = (entry.senderName || '').trim().toLowerCase();
@@ -397,28 +418,17 @@ class MessageMonitor {
                     const ts = entry.timestamp || Date.now();
                     let acc;
                     try {
-                        acc = db.prepare('SELECT nickname, fb_name, fb_user_id FROM accounts WHERE id = ?').get(accountId);
-                    } catch (e) {
                         acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
-                    }
+                    } catch (_) { acc = null; }
                     let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
                     label = label.replace(/^\(\d+\+?\)\s*/, '');
-                    const fbIdPart = (acc && acc.fb_user_id) ? ` | FB ID: ${esc(String(acc.fb_user_id))}` : '';
-                    const dateStr = new Date(ts).toLocaleString();
-                    const lines = [
-                        `📩 ${esc(entry.senderName)}`,
-                        `💬 ${esc(entry.body)}`,
-                        ``,
-                        `🏪 Account: ${esc(label)}${fbIdPart} | ${esc(accountId)}`,
-                        `🕒 ${dateStr}`,
-                        `↩️ Swipe\\-reply to respond`,
-                    ].join('\n');
-                    const replyCtx = { accountId, conversationId: chat.convId, senderName: entry.senderName };
-                    this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
-                        console.error('[Monitor] Telegram notify failed (from pending):', err.message)
+                    const replyCtx = { accountId, conversationId: chat.convId, senderName: entry.senderName, accountLabel: label };
+                    NotificationOutbox.enqueue(
+                        { senderName: entry.senderName, body: entry.body, accountId, accountLabel: label, timestamp: ts },
+                        replyCtx
                     );
                     this._removePending(key);
-                    isDuplicate(entry.senderName, entry.body);
+                    isDuplicate(entry.senderName, entry.body, accountId);
                     break; // one notification per pending entry
                 }
             }
@@ -473,9 +483,14 @@ class MessageMonitor {
             // Detect unread messages — only fire notifications AFTER seed scan
             if (chat.isUnread && chat.senderName) {
                 const body = isValidBody(chat.preview) ? chat.preview : null;
-                const isNew = !prev ||
-                    (body && prev.preview !== chat.preview) ||
-                    (!prev.isUnread && chat.isUnread);
+                // isNew: fires when this is a new conversation, or the preview changed, or
+                // it just became unread. Also fires if preview is unchanged but it's been
+                // unread for >30s (catches repeat-message case where FB sidebar doesn't refresh).
+                const becameUnread = !prev || (!prev.isUnread && chat.isUnread);
+                const previewChanged = body && prev && prev.preview !== chat.preview;
+                const persistentUnread = chat.isUnread && prev && prev.isUnread &&
+                    (Date.now() - (prev.lastUnreadAt || 0)) > 30_000;
+                const isNew = !prev || becameUnread || previewChanged || persistentUnread;
 
                 // Seed scan: record state silently, do NOT notify
                 if (!state.seeded) {
@@ -500,12 +515,15 @@ class MessageMonitor {
                 }
             }
 
-            // Preserve lastSentReply across polls so it's not lost on the next tick
+            // Preserve lastSentReply and unread tracking across polls
             state.sidebarState.set(chat.convId, {
                 preview: chat.preview,
                 isUnread: chat.isUnread,
-                lastSentReply,   // carry forward until a genuinely new incoming message overwrites
+                lastSentReply,
                 senderName: chat.senderName,
+                lastUnreadAt: chat.isUnread
+                    ? ((prev && prev.isUnread) ? (prev.lastUnreadAt || Date.now()) : Date.now())
+                    : undefined,
             });
         }
 
@@ -591,7 +609,7 @@ class MessageMonitor {
         if (hasRealConvId && this._pendingTelegram.has(key)) {
             this._removePending(key);
             // Fall through — do not treat as duplicate
-        } else if (isDuplicate(senderName, body)) {
+        } else if (isDuplicate(senderName, body, accountId)) {
             return;
         }
 
@@ -603,8 +621,23 @@ class MessageMonitor {
         const msgId = `msg_${threadId}_${ts}_${Math.random().toString(36).substring(2, 8)}`;
 
         try {
-            // Wrap both inserts in a transaction — either both succeed or neither does
+            const eventKey = buildEventKey(accountId, threadId, senderName, body, ts);
+
+            // Wrap inserts in one transaction. If inbound event already exists,
+            // we skip all downstream work for this logical message.
+            let inboundEventId = null;
             const insertTx = db.transaction(() => {
+                const eventResult = db.prepare(`
+                    INSERT OR IGNORE INTO inbound_events
+                        (event_key, account_id, conversation_id, sender_name, body, detected_by, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                `).run(eventKey, accountId, threadId, senderName, body, detectedBy, ts, Date.now());
+
+                if (eventResult.changes === 0) {
+                    return null;
+                }
+                inboundEventId = Number(eventResult.lastInsertRowid);
+
                 db.prepare(`
                     INSERT INTO conversations (id, account_id, last_message, last_message_at, unread_count)
                     VALUES (?, ?, ?, ?, 1)
@@ -619,8 +652,22 @@ class MessageMonitor {
                     VALUES (?, ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(id) DO NOTHING
                 `).run(msgId, threadId, accountId, senderName, body, ts);
+
+                db.prepare(`
+                    UPDATE inbound_events
+                    SET status = 'stored', updated_at = ?
+                    WHERE event_key = ?
+                `).run(Date.now(), eventKey);
+
+                return inboundEventId;
             });
-            insertTx();
+            const insertedEventId = insertTx();
+            if (!insertedEventId) {
+                return;
+            }
+
+            // Store for outbox enqueue linkage below.
+            data._inboundEventId = insertedEventId;
         } catch (err) {
             console.error('[Monitor] DB write error:', err.message);
         }
@@ -634,28 +681,15 @@ class MessageMonitor {
 
         // Push to Telegram — only when we have a real conversation ID (never send without reply context).
         if (this._telegramBot) {
-            const esc = (t) => (t || '').replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
             let acc;
             try {
-                acc = db.prepare('SELECT nickname, fb_name, fb_user_id FROM accounts WHERE id = ?').get(accountId);
-            } catch (e) {
                 acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
-            }
+            } catch (_) { acc = null; }
             let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
             label = label.replace(/^\(\d+\+?\)\s*/, '');
-            const fbIdPart = (acc && acc.fb_user_id) ? ` | FB ID: ${esc(String(acc.fb_user_id))}` : '';
-            const dateStr = new Date(ts).toLocaleString();
-            const lines = [
-                `📩 ${esc(senderName)}`,
-                `💬 ${esc(body)}`,
-                ``,
-                `🏪 Account: ${esc(label)}${fbIdPart} | ${esc(accountId)}`,
-                `🕒 ${dateStr}`,
-                `↩️ Swipe\\-reply to respond`,
-            ].join('\n');
 
             const isRealConvId = threadId && !threadId.startsWith('unknown_');
-            let replyCtx = isRealConvId ? { accountId, conversationId: threadId, senderName } : null;
+            let replyCtx = isRealConvId ? { accountId, conversationId: threadId, senderName, accountLabel: label } : null;
 
             if (!isRealConvId) {
                 // Try to resolve conversationId from current sidebar state (match by senderName + body/preview).
@@ -668,7 +702,6 @@ class MessageMonitor {
                         const entrySender = (entry.senderName || '').trim().toLowerCase();
                         if (entrySender !== senderNorm) continue;
                         if (!sidebarMatchPreview(body, entry)) continue;
-                        // Prefer unread when multiple conversations match (same sender, same preview).
                         const unread = !!entry.isUnread;
                         if (!matchedConvId || unread) {
                             matchedConvId = convId;
@@ -677,12 +710,14 @@ class MessageMonitor {
                         }
                     }
                     if (matchedConvId) {
-                        replyCtx = { accountId, conversationId: matchedConvId, senderName };
+                        replyCtx = { accountId, conversationId: matchedConvId, senderName, accountLabel: label };
                     }
                 }
                 if (replyCtx) {
-                    this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
-                        console.error('[Monitor] Telegram notify failed:', err.message)
+                    NotificationOutbox.enqueue(
+                        { senderName, body, accountId, accountLabel: label, timestamp: ts },
+                        replyCtx,
+                        { inboundEventId: data._inboundEventId || null }
                     );
                 } else {
                     // No match — add to pending so a later _pollSidebar can send when sidebar has the conv.
@@ -694,8 +729,10 @@ class MessageMonitor {
                     }
                 }
             } else {
-                this._telegramBot.sendNotification(lines, replyCtx).catch(err =>
-                    console.error('[Monitor] Telegram notify failed:', err.message)
+                NotificationOutbox.enqueue(
+                    { senderName, body, accountId, accountLabel: label, timestamp: ts },
+                    replyCtx,
+                    { inboundEventId: data._inboundEventId || null }
                 );
             }
         }

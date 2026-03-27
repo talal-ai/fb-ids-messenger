@@ -20,6 +20,8 @@ function initDatabase() {
     // Wait up to 5s instead of immediately failing when DB is locked
     // Prevents 'database is locked' errors when many accounts write simultaneously
     db.pragma('busy_timeout = 5000');
+    // Better write throughput under concurrent worker updates
+    db.pragma('synchronous = NORMAL');
 
     // Load schema
     const schemaPath = path.join(__dirname, 'schema.sql');
@@ -27,6 +29,17 @@ function initDatabase() {
         const schema = fs.readFileSync(schemaPath, 'utf-8');
         db.exec(schema);
         console.log('[DB] Schema applied');
+    }
+
+    // Schema versioning for additive phased migrations
+    try {
+        const v = db.pragma('user_version', { simple: true }) || 0;
+        if (v < 2) {
+            db.pragma('user_version = 2');
+            console.log('[DB] Schema user_version set to 2 (durable pipeline tables)');
+        }
+    } catch (e) {
+        console.error('[DB] Failed to update schema version:', e.message);
     }
 
     // Migrations: add columns if missing
@@ -42,6 +55,28 @@ function initDatabase() {
         }
     } catch (e) {
         console.error('[DB] Migration error:', e);
+    }
+
+    // Migration: ensure durable outbox has context_json for retry-safe routing.
+    try {
+        const outboxCols = db.prepare("PRAGMA table_info(notification_outbox)").all().map(c => c.name);
+        if (outboxCols.length > 0 && !outboxCols.includes('context_json')) {
+            db.exec('ALTER TABLE notification_outbox ADD COLUMN context_json TEXT');
+            console.log('[DB] Migration: added notification_outbox.context_json');
+        }
+    } catch (e) {
+        // Table may not exist on very old installs before schema apply
+    }
+
+    // Migration: ensure reply_jobs has legacy_queue_id for dual-write status sync.
+    try {
+        const replyJobCols = db.prepare("PRAGMA table_info(reply_jobs)").all().map(c => c.name);
+        if (replyJobCols.length > 0 && !replyJobCols.includes('legacy_queue_id')) {
+            db.exec('ALTER TABLE reply_jobs ADD COLUMN legacy_queue_id INTEGER');
+            console.log('[DB] Migration: added reply_jobs.legacy_queue_id');
+        }
+    } catch (e) {
+        // Table may not exist before schema apply
     }
 
     // Migration: rebuild messages table to add ON DELETE CASCADE on account_id.
@@ -109,6 +144,41 @@ function initDatabase() {
         const qCleaned = db.prepare("DELETE FROM reply_queue WHERE status != 'pending' AND created_at < ?").run(queueCutoff);
         if (qCleaned.changes > 0) console.log(`[DB] Cleaned ${qCleaned.changes} old reply queue record(s)`);
     } catch (e) { /* reply_queue may not exist on first boot before schema runs — ignore */ }
+
+    // Cleanup: keep inbound/outbox/reply_jobs lean by deleting old terminal rows.
+    // Pending/active rows are never touched.
+    try {
+        const old14d = Date.now() - (14 * 24 * 60 * 60 * 1000);
+        const old30d = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+        const inboundCleaned = db.prepare(
+            "DELETE FROM inbound_events WHERE status IN ('notified', 'failed') AND created_at < ?"
+        ).run(old14d);
+
+        const outboxCleaned = db.prepare(
+            "DELETE FROM notification_outbox WHERE status IN ('sent', 'dead_letter') AND created_at < ?"
+        ).run(old14d);
+
+        const replyJobsCleaned = db.prepare(
+            "DELETE FROM reply_jobs WHERE status IN ('sent', 'dead_letter') AND created_at < ?"
+        ).run(old14d);
+
+        const deadLettersCleaned = db.prepare(
+            'DELETE FROM dead_letters WHERE created_at < ?'
+        ).run(old30d);
+
+        const totalCleaned =
+            (inboundCleaned.changes || 0) +
+            (outboxCleaned.changes || 0) +
+            (replyJobsCleaned.changes || 0) +
+            (deadLettersCleaned.changes || 0);
+
+        if (totalCleaned > 0) {
+            console.log(`[DB] Cleaned ${totalCleaned} old durable-pipeline record(s)`);
+        }
+    } catch (e) {
+        // New tables may not exist on some older installs until first schema apply
+    }
 
     return db;
 }

@@ -2,7 +2,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const Store = require('electron-store');
 const store = new Store();
-const PlaywrightManager = require('./playwright-manager');
 const ReplyService = require('./reply-service');
 const Database = require('../db/database');
 
@@ -16,15 +15,118 @@ let lastConnectivity = null;
 let conflictLogged = false;
 let initInProgress = false;
 
-// ── Reply context tracking ──────────────────────────────────────────────────
-// Reply context is now persisted in SQLite (reply_context table) so it
-// survives restarts and works for up to 30 days.
-// Maps Telegram message_id → { accountId, conversationId, senderName }
+// ── Active conversation registry ────────────────────────────────────────────
+// Maps a stable slot number → conversation context.
+// Slot numbers are assigned sequentially and NEVER reused or wrapped.
+// This means operator can safely type "/re 3 message" at any time — #3 always
+// means the same conversation, even after 100 more messages arrive.
+// Old entries expire after TTL and are removed from /list output, but their
+// slot number is never recycled (convSlotCounter only increments).
+const activeConvs = new Map();  // slot (number) → { accountId, conversationId, senderName, accountLabel, lastAt }
+// Secondary index: "accountId|conversationId" → slot — prevents duplicate tracking
+const convKeyToSlot = new Map();
+let convSlotCounter = 0;
+const MAX_ACTIVE_CONVS = 50; // keep more — slots never wrap so this is just a display cap for /list
+const ACTIVE_CONV_TTL_MS = 8 * 60 * 60 * 1000;  // 8 hours
 
-// Track the most recent incoming conversation for /r shortcut
-// Persisted to electron-store so it survives restarts
-let lastIncoming = store.get('last_incoming_context') || null;
+// ── Serial notification queue ───────────────────────────────────────────────
+// Ensures notifications are sent ONE AT A TIME so the active-conv ring stays
+// ordered and reply_context DB writes never race with each other.
+let _notifQueue = Promise.resolve();
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Escape HTML special characters for Telegram HTML parse mode.
+ * Simpler and more reliable than MarkdownV2 — just &, <, > need escaping.
+ */
+function h(text) {
+    if (!text) return '';
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Parse the embedded routing reference from a Telegram notification text.
+ * Every notification ends with a line:  ref:ACCOUNTID:CONVID
+ * This is the fallback when the reply_context DB lookup fails.
+ */
+function parseRefFromText(text) {
+    if (!text) return null;
+    const match = text.match(/ref:([^\s:]+):([^\s\n]+)/);
+    if (!match) return null;
+    const accountId = match[1];
+    const conversationId = match[2];
+    if (!accountId || !conversationId) return null;
+    return { accountId, conversationId };
+}
+
+/**
+ * Track a conversation in the active-conv registry.
+ * If already tracked (by accountId + conversationId), updates timestamp and returns the same slot.
+ * If new, assigns the next slot number — slot numbers are NEVER reused or wrapped.
+ * Returns the slot number.
+ */
+function trackActiveConv(context) {
+    if (!context || !context.accountId || !context.conversationId) return null;
+
+    const key = `${context.accountId}|${context.conversationId}`;
+
+    // Already tracked — update in-place, return same slot
+    if (convKeyToSlot.has(key)) {
+        const slot = convKeyToSlot.get(key);
+        const entry = activeConvs.get(slot);
+        if (entry) {
+            entry.senderName = context.senderName || entry.senderName;
+            entry.accountLabel = context.accountLabel || entry.accountLabel;
+            entry.lastAt = Date.now();
+        }
+        return slot;
+    }
+
+    // New conversation — assign next slot (never wraps)
+    convSlotCounter++;
+    const slot = convSlotCounter;
+    activeConvs.set(slot, {
+        accountId: context.accountId,
+        conversationId: context.conversationId,
+        senderName: context.senderName || 'Unknown',
+        accountLabel: context.accountLabel || context.accountId,
+        lastAt: Date.now(),
+    });
+    convKeyToSlot.set(key, slot);
+
+    // Evict oldest TTL-expired entries from the Map to prevent unbounded growth
+    if (activeConvs.size > MAX_ACTIVE_CONVS * 2) {
+        const now = Date.now();
+        for (const [s, e] of activeConvs) {
+            if ((now - e.lastAt) > ACTIVE_CONV_TTL_MS) {
+                convKeyToSlot.delete(`${e.accountId}|${e.conversationId}`);
+                activeConvs.delete(s);
+            }
+        }
+    }
+
+    return slot;
+}
+
+/** Returns active conversations sorted by most recent first, excluding TTL-expired entries. */
+function getActiveConvsSorted() {
+    const now = Date.now();
+    return [...activeConvs.entries()]
+        .filter(([, e]) => (now - e.lastAt) < ACTIVE_CONV_TTL_MS)
+        .sort((a, b) => b[1].lastAt - a[1].lastAt);
+}
+
+/** Human-readable relative time (e.g. "2m ago"). */
+function relativeTime(ms) {
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return 'just now';
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+    return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+// ── Connection helpers ──────────────────────────────────────────────────────
 
 // Helper to test connection with a specific agent
 function testConnection(token, agent) {
@@ -79,7 +181,7 @@ function sendTelegramApiMessage(token, targetChatId, text, agent) {
         const payload = JSON.stringify({
             chat_id: chatIdValue,
             text,
-            parse_mode: 'Markdown'
+            parse_mode: 'HTML'
         });
 
         console.log('[Telegram] sendMessage → chat_id present, type=', typeof chatIdValue);
@@ -210,14 +312,15 @@ async function initBot(token, targetChatId, proxyUrl) {
 
     console.log(`[Telegram] Initializing Bot with strategy: ${strategy}`);
     
-    // Safety check for token
+    // Safety check for token — always reset chatId so stale value never leaks (fix C-4)
+    chatId = null;
     if (!token) {
         console.error('[Telegram] Cannot start bot: Token is missing!');
         initInProgress = false;
         return;
     }
 
-    bot = new TelegramBot(token, { 
+    bot = new TelegramBot(token, {
         polling: true,
         request: requestOptions
     });
@@ -243,131 +346,241 @@ async function initBot(token, targetChatId, proxyUrl) {
 
     bot.on('message', async (msg) => {
         try {
-        // auto-persist chat id of whoever talks to the bot
-        try {
-            const incomingId = String(msg.chat && msg.chat.id);
-            if (incomingId && incomingId !== String(chatId)) {
-                chatId = incomingId;
-                store.set('telegram_chat_id', chatId);
-                console.log('[Telegram] Auto-saved chat_id', chatId);
-            }
-        } catch (e) { /* ignore */ }
-
-        if (!msg.text) return;
-        const text = msg.text.trim();
-
-        // ── Method 1: REPLY TO MESSAGE (most seamless) ──────────────────
-        // User swipes/replies to a notification → auto-route the reply
-        if (msg.reply_to_message && msg.reply_to_message.message_id) {
+            // Auto-persist chat id only if no chat_id is configured yet.
+            // This prevents routing from switching when another user/group messages the bot.
             try {
-                const db = Database.getDb();
-                const ctx = db.prepare('SELECT account_id, conversation_id, sender_name FROM reply_context WHERE telegram_msg_id = ?')
-                    .get(msg.reply_to_message.message_id);
+                const incomingId = String(msg.chat && msg.chat.id);
+                if ((!chatId || String(chatId).trim() === '') && incomingId) {
+                    chatId = incomingId;
+                    store.set('telegram_chat_id', chatId);
+                    console.log('[Telegram] Auto-saved chat_id', chatId);
+                }
+            } catch (_) {}
+
+            if (!msg.text) return;
+            const text = msg.text.trim();
+            const tgChatId = msg.chat.id;
+
+            // Process commands only from the configured chat.
+            // This keeps message/reply routing deterministic for one operator endpoint.
+            if (chatId && String(tgChatId) !== String(chatId)) {
+                console.warn(`[Telegram] Ignoring message from unauthorized chat: ${tgChatId}`);
+                return;
+            }
+
+            // ── METHOD 1: Swipe-Reply ────────────────────────────────────
+            // Operator swipes on any notification and types a reply.
+            // Step 1: DB lookup by telegram message_id (primary routing).
+            // Step 2: If DB fails, parse the embedded ref:ACC:CONV code from the
+            //         quoted message text (fallback — always works).
+            if (msg.reply_to_message) {
+                let ctx = null;
+
+                // Step 1 — DB lookup
+                try {
+                    const db = Database.getDb();
+                    const row = db.prepare(
+                        'SELECT account_id, conversation_id, sender_name FROM reply_context WHERE telegram_msg_id = ?'
+                    ).get(msg.reply_to_message.message_id);
+                    if (row) {
+                        ctx = { accountId: row.account_id, conversationId: row.conversation_id, senderName: row.sender_name };
+                    }
+                } catch (dbErr) {
+                    console.error('[Telegram] reply_context lookup failed:', dbErr.message);
+                }
+
+                // Step 2 — Fallback: parse ref: code from quoted message text
+                if (!ctx) {
+                    const quotedText = msg.reply_to_message.text || '';
+                    const parsed = parseRefFromText(quotedText);
+                    if (parsed) {
+                        // Enrich with senderName from active-conv ring if available
+                        for (const [, entry] of activeConvs) {
+                            if (entry.accountId === parsed.accountId && entry.conversationId === parsed.conversationId) {
+                                parsed.senderName = entry.senderName;
+                                break;
+                            }
+                        }
+                        ctx = parsed;
+                        console.log('[Telegram] Swipe-reply routed via ref: fallback');
+                    }
+                }
+
                 if (ctx) {
-                    await _sendFbReply(msg.chat.id, ctx.account_id, ctx.conversation_id, ctx.sender_name, text);
+                    await _sendFbReply(tgChatId, ctx.accountId, ctx.conversationId, ctx.senderName, text);
+                } else {
+                    // Both DB and fallback failed — give operator actionable alternatives
+                    const convs = getActiveConvsSorted();
+                    let errMsg = '⚠️ <b>Cannot route reply</b> — conversation ID not found.\n\n';
+                    if (convs.length > 0) {
+                        errMsg += 'Use /list to see active conversations, then reply with:\n';
+                        errMsg += '<code>/re 1 your message</code>\n\n';
+                        errMsg += '<b>Recent conversations:</b>\n';
+                        for (const [slot, entry] of convs.slice(0, 5)) {
+                            errMsg += `  #${slot} — ${h(entry.senderName)} → ${h(entry.accountLabel)} (${relativeTime(entry.lastAt)})\n`;
+                        }
+                    } else {
+                        errMsg += 'No active conversations tracked yet.';
+                    }
+                    bot.sendMessage(tgChatId, errMsg, { parse_mode: 'HTML' });
+                }
+                return;
+            }
+
+            // ── /list (or /active) ———  Show active conversations ───────
+            if (text === '/list' || text === '/active' || text === '/l') {
+                const convs = getActiveConvsSorted();
+                if (convs.length === 0) {
+                    bot.sendMessage(tgChatId,
+                        '📭 No active conversations in the last 8 hours.\n\nThey appear automatically when new messages arrive.',
+                        { parse_mode: 'HTML' });
                     return;
                 }
-            } catch (dbErr) {
-                console.error('[Telegram] Reply context DB lookup failed:', dbErr.message);
-            }
-            // Replied to a notification that has no routing context (unknown conv ID)
-            bot.sendMessage(msg.chat.id,
-                '⚠️ Cannot route this reply — conversation ID was not detected.\n'
-                + 'Use /r <message> to reply to the last known conversation.');
-            return;
-        }
-
-        // ── Method 2: /r <message> — reply to LAST conversation ─────────
-        if (text.startsWith('/r ') || text.startsWith('/R ')) {
-            if (!lastIncoming) {
-                bot.sendMessage(msg.chat.id, '⚠️ No recent conversation to reply to. Wait for a new message first.');
+                const lines = ['📋 <b>Active Conversations</b>\n'];
+                for (const [slot, entry] of convs) {
+                    lines.push(`<b>${slot}.</b> ${h(entry.senderName)} → ${h(entry.accountLabel)}  <i>(${relativeTime(entry.lastAt)})</i>`);
+                }
+                lines.push('');
+                lines.push('Reply: <code>/re N your message</code>');
+                bot.sendMessage(tgChatId, lines.join('\n'), { parse_mode: 'HTML' });
                 return;
             }
-            const message = text.substring(3).trim();
-            if (!message) {
-                bot.sendMessage(msg.chat.id, 'Usage: /r <your message>');
-                return;
-            }
-            await _sendFbReply(msg.chat.id, lastIncoming.accountId, lastIncoming.conversationId, lastIncoming.senderName, message);
-            return;
-        }
 
-        // ── Method 3: /reply <accountId> <conversationId> <message> ─────
-        if (text.startsWith('/reply ')) {
-            const parts = text.split(' ');
-            if (parts.length < 4) {
-                bot.sendMessage(msg.chat.id, 'Usage: /reply <accountId> <conversationId> <message>');
-                return;
-            }
-            const accountId = parts[1];
-            const conversationId = parts[2];
-            const message = parts.slice(3).join(' ');
-            await _sendFbReply(msg.chat.id, accountId, conversationId, null, message);
-            return;
-        }
+            // ── /re N message ─────  Reply to conversation by slot number ─
+            if (/^\/re(\s|$)/i.test(text)) {
+                const parts = text.split(/\s+/);
+                const slot = parseInt(parts[1], 10);
+                const message = parts.slice(2).join(' ');
 
-        // ── /help command ───────────────────────────────────────────────
-        if (text === '/help' || text === '/start') {
-            const helpText = [
-                '📬 *Multi-FB Manager Bot*',
-                '',
-                '*How to reply to Facebook messages:*',
-                '',
-                '1️⃣ *Swipe Reply* (easiest):',
-                '   Just reply to any notification message',
-                '   and your text is sent to that conversation.',
-                '',
-                '2️⃣ */r <message>*:',
-                '   Quick reply to the most recent conversation.',
-                '   Example: `/r Hey, I will check!`',
-                '',
-                '3️⃣ */reply <acc> <conv> <msg>*:',
-                '   Manual reply with full IDs (advanced).',
-                '',
-                '📊 */status* — Show active accounts',
-            ].join('\n');
-            bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
-            return;
-        }
-
-        // ── /status command ─────────────────────────────────────────────
-        if (text === '/status') {
-            try {
-                const Database = require('../db/database');
-                const db = Database.getDb();
-                const accounts = db.prepare('SELECT id, nickname, fb_name FROM accounts').all();
-                if (!accounts.length) {
-                    bot.sendMessage(msg.chat.id, 'No accounts configured.');
+                if (isNaN(slot) || slot < 1) {
+                    bot.sendMessage(tgChatId,
+                        '❌ Usage: <code>/re N your message</code>\nUse /list to see conversation numbers.',
+                        { parse_mode: 'HTML' });
                     return;
                 }
-                const lines = ['📊 *Active Accounts:*', ''];
-                for (const a of accounts) {
-                    const label = a.fb_name || a.nickname || a.id;
-                    lines.push(`• ${label} (\`${a.id}\`)`);
+
+                const entry = activeConvs.get(slot);
+                if (!entry) {
+                    const convs = getActiveConvsSorted();
+                    let errMsg = `❌ Conversation <b>#${slot}</b> not found or expired.\n\n`;
+                    if (convs.length > 0) {
+                        errMsg += '<b>Available:</b>\n';
+                        for (const [s, e] of convs.slice(0, 8)) {
+                            errMsg += `  #${s} — ${h(e.senderName)} (${relativeTime(e.lastAt)})\n`;
+                        }
+                    }
+                    bot.sendMessage(tgChatId, errMsg, { parse_mode: 'HTML' });
+                    return;
                 }
-                bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
-            } catch (e) {
-                bot.sendMessage(msg.chat.id, `Error: ${e.message}`);
+
+                if (!message) {
+                    // Just show conversation info
+                    bot.sendMessage(tgChatId,
+                        `ℹ️ Conversation <b>#${slot}</b>:\n${h(entry.senderName)} → ${h(entry.accountLabel)}\nLast message: ${relativeTime(entry.lastAt)}\n\nTo reply: <code>/re ${slot} your message</code>`,
+                        { parse_mode: 'HTML' });
+                    return;
+                }
+
+                await _sendFbReply(tgChatId, entry.accountId, entry.conversationId, entry.senderName, message);
+                return;
             }
-            return;
-        }
+
+            // ── /reply accId convId message ──  Advanced / debug routing ──
+            if (text.startsWith('/reply ')) {
+                const parts = text.split(/\s+/);
+                if (parts.length < 4) {
+                    bot.sendMessage(tgChatId,
+                        '❌ Usage: <code>/reply &lt;accountId&gt; &lt;conversationId&gt; &lt;message&gt;</code>',
+                        { parse_mode: 'HTML' });
+                    return;
+                }
+                const accountId = parts[1];
+                const conversationId = parts[2];
+                const message = parts.slice(3).join(' ');
+                // Validate account exists before routing
+                try {
+                    const db = Database.getDb();
+                    const acc = db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId);
+                    if (!acc) {
+                        bot.sendMessage(tgChatId,
+                            `❌ Account <code>${h(accountId)}</code> not found. Use /status to list accounts.`,
+                            { parse_mode: 'HTML' });
+                        return;
+                    }
+                } catch (_) {}
+                await _sendFbReply(tgChatId, accountId, conversationId, null, message);
+                return;
+            }
+
+            // ── /status ──────────────────────────────────────────────────
+            if (text === '/status') {
+                try {
+                    const db = Database.getDb();
+                    const accounts = db.prepare('SELECT id, nickname, fb_name, status FROM accounts').all();
+                    if (!accounts.length) {
+                        bot.sendMessage(tgChatId, 'No accounts configured.');
+                        return;
+                    }
+                    const lines = ['📊 <b>Accounts</b>\n'];
+                    for (const a of accounts) {
+                        const label = a.fb_name || a.nickname || a.id;
+                        const statusIcon = a.status === 'active' ? '🟢' : a.status === 'needs_login' ? '🔴' : '⚫';
+                        lines.push(`${statusIcon} ${h(label)} — <code>${h(a.id)}</code>`);
+                    }
+                    bot.sendMessage(tgChatId, lines.join('\n'), { parse_mode: 'HTML' });
+                } catch (e) {
+                    bot.sendMessage(tgChatId, `Error: ${h(e.message)}`, { parse_mode: 'HTML' });
+                }
+                return;
+            }
+
+            // ── /help or /start ───────────────────────────────────────────
+            if (text === '/help' || text === '/start') {
+                const helpText = [
+                    '📬 <b>Multi-FB Manager</b>',
+                    '',
+                    '<b>Replying to Facebook messages:</b>',
+                    '',
+                    '1️⃣ <b>Swipe Reply</b> (recommended)',
+                    '   Long-press any notification → Reply.',
+                    '   Works even if you receive 50 messages at once.',
+                    '',
+                    '2️⃣ <b>/list</b>',
+                    '   Shows all active conversations with numbers.',
+                    '',
+                    '3️⃣ <b>/re N your message</b>',
+                    '   Reply to conversation #N from /list.',
+                    '   e.g. <code>/re 1 Yes, still available!</code>',
+                    '',
+                    '4️⃣ <b>/reply accId convId message</b>',
+                    '   Advanced routing with explicit IDs.',
+                    '',
+                    '📊 /status — show accounts',
+                    '📋 /list   — show active conversations',
+                ].join('\n');
+                bot.sendMessage(tgChatId, helpText, { parse_mode: 'HTML' });
+                return;
+            }
+
         } catch (outerErr) {
             console.error('[Telegram] Unhandled error in message handler:', outerErr.message);
             try { bot.sendMessage(msg.chat.id, '❌ Internal error. Please try again.'); } catch (_) {}
         }
     });
+
+    // Internal: execute the Facebook reply (called from all routing methods above)
     async function _sendFbReply(tgChatId, accountId, conversationId, senderName, message) {
-        const label = senderName ? `to ${senderName}` : `on ${accountId}`;
+        const label = senderName ? `to <b>${h(senderName)}</b>` : `on <code>${h(accountId)}</code>`;
         try {
-            bot.sendMessage(tgChatId, `⏳ Sending reply ${label}...`);
+            bot.sendMessage(tgChatId, `⏳ Sending reply ${label}...`, { parse_mode: 'HTML' });
             const result = await ReplyService.queueReply(accountId, conversationId, message);
             if (result.success) {
-                bot.sendMessage(tgChatId, `✅ Reply sent ${label}`);
+                bot.sendMessage(tgChatId, `✅ Reply sent ${label}`, { parse_mode: 'HTML' });
             } else {
-                bot.sendMessage(tgChatId, `❌ Reply failed: ${result.reason}`);
+                bot.sendMessage(tgChatId, `❌ Reply failed ${label}: ${h(result.reason)}`, { parse_mode: 'HTML' });
             }
         } catch (err) {
-            bot.sendMessage(tgChatId, `❌ Failed: ${err.message}`);
+            bot.sendMessage(tgChatId, `❌ Failed ${label}: ${h(err.message)}`, { parse_mode: 'HTML' });
         }
     }
 
@@ -375,35 +588,68 @@ async function initBot(token, targetChatId, proxyUrl) {
 }
 
 /**
- * Escape Markdown special characters so Telegram doesn't choke on user content.
+ * Send a notification to the operator's Telegram chat.
+ *
+ * Accepts a structured notifData object so this module owns formatting.
+ * Enqueued serially — notifications are NEVER sent concurrently.
+ * This ensures:
+ *   - activeConvs ring stays correctly ordered
+ *   - reply_context DB writes never race
+ *   - lastIncoming / slot numbers are stable before the next notification
+ *
+ * @param {object} notifData - { senderName, body, accountId, accountLabel, timestamp }
+ * @param {object|null} context  - { accountId, conversationId, senderName, accountLabel } for reply routing
  */
-function escapeMarkdown(text) {
-    if (!text) return '';
-    return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+function sendNotification(notifData, context) {
+    _notifQueue = _notifQueue
+        .then(() => _doSendNotification(notifData, context))
+        .catch(() => {}); // keep the chain alive on error
+    return _notifQueue;
 }
 
-/**
- * Send a notification message to the configured Telegram chat.
- * Called by MessageMonitor when a new FB message arrives.
- * Returns the sent message object (has message_id for reply tracking).
- * Retries up to 3 times with exponential backoff.
- *
- * @param {string} text - Notification text
- * @param {object} [context] - { accountId, conversationId, senderName } for reply routing
- */
-async function sendNotification(text, context, retries = 3) {
+async function _doSendNotification(notifData, context) {
     if (!bot || !chatId) {
-        console.warn('[Telegram] Cannot send notification: bot or chatId missing');
+        console.warn('[Telegram] Cannot send notification: bot or chatId not ready');
         return null;
     }
 
+    const { senderName = 'Unknown', body = '', accountId = '', accountLabel = accountId, timestamp } = notifData || {};
+
+    // Assign a slot number BEFORE sending so it's in the message
+    const slot = context ? trackActiveConv({ ...context, accountLabel }) : null;
+    const slotTag = slot ? ` • <b>#${slot}</b>` : '';
+
+    const dateStr = new Date(timestamp || Date.now()).toLocaleString();
+
+    // Build notification with HTML (no backslash escaping issues)
+    // The last line embeds the routing ref as a parseable fallback for swipe-reply
+    const lines = [
+        `📩 <b>${h(senderName)}</b>`,
+        `💬 ${h(body)}`,
+        ``,
+        `🏪 ${h(accountLabel)}${slotTag}`,
+        `🕒 ${dateStr}`,
+    ];
+
+    if (context && context.conversationId && !context.conversationId.startsWith('unknown_')) {
+        // Embedded routing reference — machine-parseable fallback for swipe-reply
+        lines.push(`<code>ref:${accountId}:${context.conversationId}</code>`);
+        lines.push(`↩ Swipe to reply${slot ? ` • or: /re ${slot} message` : ''}`);
+    } else {
+        lines.push(`⚠️ Conversation ID not yet resolved — swipe-reply may not work`);
+        if (slot) lines.push(`Use: /re ${slot} message`);
+    }
+
+    const text = lines.join('\n');
+
+    const retries = 3;
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const sentMsg = await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-            console.log('[Telegram] Notification sent');
+            const sentMsg = await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+            console.log(`[Telegram] Notification sent (slot=${slot}, msg_id=${sentMsg && sentMsg.message_id})`);
 
-            // Persist reply context to SQLite so swipe-replies work across restarts
-            if (sentMsg && sentMsg.message_id && context) {
+            // Persist reply_context so swipe-reply survives bot restarts
+            if (sentMsg && sentMsg.message_id && context && context.conversationId) {
                 try {
                     const db = Database.getDb();
                     db.prepare(`
@@ -411,12 +657,8 @@ async function sendNotification(text, context, retries = 3) {
                         VALUES (?, ?, ?, ?, ?)
                     `).run(sentMsg.message_id, context.accountId, context.conversationId, context.senderName, Date.now());
                 } catch (dbErr) {
-                    console.error('[Telegram] Failed to persist reply context:', dbErr.message);
+                    console.error('[Telegram] Failed to persist reply_context:', dbErr.message);
                 }
-
-                // Update lastIncoming for /r shortcut (persisted to electron-store)
-                lastIncoming = context;
-                store.set('last_incoming_context', context);
             }
             return sentMsg;
         } catch (err) {
@@ -438,7 +680,7 @@ async function sendTestMessage(token, targetChatId, proxyUrl) {
         return { success: false, error: 'Missing Telegram Chat ID' };
     }
 
-    const text = '✅ *Test message from FB Hub!*\n\nYour Telegram integration is working correctly.';
+    const text = '✅ <b>Test message from FB Hub!</b>\n\nYour Telegram integration is working correctly.';
 
     let proxyAgent = null;
     if (proxyUrl && proxyUrl.trim() !== '') {

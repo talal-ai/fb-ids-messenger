@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const Store = require('electron-store');
+const { autoUpdater } = require('electron-updater');
+const log = require('electron-log');
 const store = new Store();
 
 // Set a friendly application name (affects menu on macOS, window title fallback etc.)
@@ -13,8 +15,30 @@ const MessageMonitor = require('./services/message-monitor');
 const TelegramBot = require('./services/telegram-bot');
 const SessionMonitor = require('./services/session-monitor');
 const PollScheduler = require('./services/poll-scheduler');
+const NotificationOutbox = require('./services/notification-outbox');
 
 let mainWindow;
+let updaterInitialized = false;
+let updaterEnabled = false;
+let updaterState = {
+    status: 'idle',
+    message: 'Idle',
+    updateInfo: null,
+    progress: null,
+    checkedAt: null,
+    error: null
+};
+
+function publishUpdaterState(partialState) {
+    updaterState = {
+        ...updaterState,
+        ...partialState
+    };
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('updater:state', updaterState);
+    }
+}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -49,7 +73,7 @@ try {
     if (cleaned.changes > 0) console.log(`[DB] Cleaned ${cleaned.changes} trivial false-positive message(s)`);
 } catch (e) { /* ignore — runs once on startup */ }
 
-function createWindow() {
+function createWindow(isDev) {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -61,11 +85,8 @@ function createWindow() {
     }
   });
 
-  // `app.isPackaged` is true when running a packaged build. We also respect
-  // NODE_ENV so that tests or other environments can override behaviour. In
-  // development we usually load the Vite server, but opening the devtools
+  // In development we usually load the Vite server, but opening the devtools
   // can be noisy for end users – allow disabling via `OPEN_DEVTOOLS`.
-  const isDev = (!app.isPackaged || process.env.NODE_ENV === 'development');
   if (isDev) {
     mainWindow.loadURL('http://localhost:3005');
     if (process.env.OPEN_DEVTOOLS === 'true') {
@@ -85,12 +106,95 @@ function createWindow() {
   });
 }
 
+function setupAutoUpdater() {
+    if (updaterInitialized) return;
+    updaterInitialized = true;
+
+  log.transports.file.level = 'info';
+  autoUpdater.logger = log;
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+
+    autoUpdater.on('checking-for-update', () => {
+        log.info('[Updater] Checking for update');
+        publishUpdaterState({
+                status: 'checking',
+                message: 'Checking for updates...',
+                checkedAt: Date.now(),
+                error: null
+        });
+    });
+    autoUpdater.on('update-available', (info) => {
+        log.info('[Updater] Update available', info);
+        publishUpdaterState({
+                status: 'available',
+                message: `New version ${info.version} is available`,
+                updateInfo: info,
+                progress: null,
+                error: null,
+                checkedAt: Date.now()
+        });
+    });
+    autoUpdater.on('update-not-available', (info) => {
+        log.info('[Updater] No update available', info);
+        publishUpdaterState({
+                status: 'not-available',
+                message: 'You are up to date',
+                updateInfo: info || null,
+                progress: null,
+                error: null,
+                checkedAt: Date.now()
+        });
+    });
+  autoUpdater.on('download-progress', (progressObj) => {
+        publishUpdaterState({
+                status: 'downloading',
+                message: `Downloading ${progressObj.percent.toFixed(1)}%`,
+                progress: progressObj,
+                error: null
+        });
+    log.info('[Updater] Download speed', progressObj.bytesPerSecond);
+    log.info('[Updater] Downloaded', progressObj.percent, '%');
+    log.info('[Updater] Total', progressObj.total, 'bytes');
+    log.info('[Updater] Transferred', progressObj.transferred, 'bytes');
+  });
+    autoUpdater.on('update-downloaded', (info) => {
+        log.info('[Updater] Update downloaded; waiting for user to restart and install');
+        publishUpdaterState({
+                status: 'downloaded',
+                message: `Version ${info.version} is ready to install`,
+                updateInfo: info,
+                progress: null,
+                error: null
+        });
+  });
+    autoUpdater.on('error', (err) => {
+        log.error('[Updater] Error', err);
+        publishUpdaterState({
+                status: 'error',
+                message: 'Update check failed',
+                error: err?.message || String(err)
+        });
+    });
+}
+
 app.whenReady().then(() => {
-    createWindow();
+    const isDev = (!app.isPackaged || process.env.NODE_ENV === 'development');
+    createWindow(isDev);
+
+    if (!isDev) {
+            updaterEnabled = true;
+      setupAutoUpdater();
+      autoUpdater.checkForUpdatesAndNotify();
+    }
 
     // Wire MessageMonitor to mainWindow + Telegram
     MessageMonitor.setMainWindow(mainWindow);
     MessageMonitor.setTelegramBot(TelegramBot);
+
+    // Durable notification sender worker (Telegram delivery with retry/dead-letter)
+    NotificationOutbox.setSender((notifData, context) => TelegramBot.sendNotification(notifData, context));
+    NotificationOutbox.start();
 
     // Start Telegram Bot if configured
     const botToken = store.get('telegram_token');
@@ -167,6 +271,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', async () => {
     PollScheduler.stop();
+    NotificationOutbox.stop();
     await PlaywrightManager.closeAll();
     if (process.platform !== 'darwin') app.quit();
 });
@@ -230,11 +335,10 @@ setInterval(async () => {
                 console.warn(`[Watchdog] Account ${acc.id} (${label}) has no browser context — alerting + relaunching...`);
                 // Notify operator via Telegram so they know a recovery is happening
                 try {
-                    const esc = (t) => (t || '').replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
-                    TelegramBot.sendNotification(
-                        `🔄 *Auto\\-Recovery*\n\nAccount: ${esc(label)} \\(${esc(acc.id)}\\)\nBrowser context was lost\\. Relaunching now\\.`,
+                    NotificationOutbox.enqueue(
+                        { senderName: '⚙️ System', body: `Auto-Recovery: browser context lost. Relaunching now.`, accountId: acc.id, accountLabel: label, timestamp: Date.now() },
                         null
-                    ).catch(() => {});
+                    );
                 } catch (_) {}
                 await launchHeadlessWithRetry(acc.id);
             }
@@ -477,4 +581,67 @@ ipcMain.handle('telegram:detect-chat', async () => {
         store.set('telegram_chat_id', result.chatId);
     }
     return result;
+});
+
+ipcMain.handle('app:version', () => {
+    return app.getVersion();
+});
+
+ipcMain.handle('updater:get-state', () => {
+    return updaterState;
+});
+
+ipcMain.handle('updater:check', async () => {
+    if (!updaterEnabled) {
+        publishUpdaterState({
+            status: 'unsupported',
+            message: 'Updates are available only in packaged builds.'
+        });
+        return updaterState;
+    }
+
+    try {
+        await autoUpdater.checkForUpdates();
+    } catch (err) {
+        publishUpdaterState({
+            status: 'error',
+            message: 'Update check failed',
+            error: err?.message || String(err)
+        });
+    }
+    return updaterState;
+});
+
+ipcMain.handle('updater:download', async () => {
+    if (!updaterEnabled) {
+        publishUpdaterState({
+            status: 'unsupported',
+            message: 'Updates are available only in packaged builds.'
+        });
+        return updaterState;
+    }
+
+    publishUpdaterState({
+        status: 'downloading',
+        message: 'Starting download...'
+    });
+
+    try {
+        await autoUpdater.downloadUpdate();
+    } catch (err) {
+        publishUpdaterState({
+            status: 'error',
+            message: 'Download failed',
+            error: err?.message || String(err)
+        });
+    }
+    return updaterState;
+});
+
+ipcMain.handle('updater:install', () => {
+    if (!updaterEnabled) {
+        return { ok: false, error: 'Updates are available only in packaged builds.' };
+    }
+    autoUpdater.quitAndInstall(false, true);
+    return { ok: true };
 });

@@ -1,6 +1,7 @@
 
 const { chromium } = require('playwright');
 const path = require('path');
+const fs = require('fs');
 const { app } = require('electron');
 const { applyPlaywrightStealth, getRandomUserAgent } = require('./stealth-service');
 
@@ -38,6 +39,27 @@ class PlaywrightManager {
     }
 
     /**
+     * Use one stable user-agent per account profile.
+     * Random UA changes between launches can trigger Facebook session challenges.
+     */
+    _getStableUserAgent(accountId, profileDir) {
+        try {
+            const uaPath = path.join(profileDir, '.ua');
+            if (fs.existsSync(uaPath)) {
+                const existing = fs.readFileSync(uaPath, 'utf8').trim();
+                if (existing) return existing;
+            }
+            const ua = getRandomUserAgent();
+            fs.mkdirSync(profileDir, { recursive: true });
+            fs.writeFileSync(uaPath, ua, 'utf8');
+            return ua;
+        } catch (_) {
+            // Fallback if file I/O fails
+            return getRandomUserAgent();
+        }
+    }
+
+    /**
      * Launch a persistent context for a specific account.
      * @param {string} accountId 
      * @param {boolean} headless - false if user needs to login interactively
@@ -65,7 +87,7 @@ class PlaywrightManager {
         const launchOptions = {
             headless: headless,
             viewport: { width: 1280, height: 800 },
-            userAgent: getRandomUserAgent(),
+            userAgent: this._getStableUserAgent(accountId, profileDir),
             args,
         };
 
