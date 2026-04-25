@@ -39,5 +39,10 @@ contextBridge.exposeInMainWorld('api', {
         const listener = (_event, payload) => callback(payload);
         ipcRenderer.on('updater:state', listener);
         return () => ipcRenderer.removeListener('updater:state', listener);
+    },
+    onControlPlaneStatus: (callback) => {
+        const listener = (_event, status) => callback(status);
+        ipcRenderer.on('control-plane:status', listener);
+        return () => ipcRenderer.removeListener('control-plane:status', listener);
     }
 });

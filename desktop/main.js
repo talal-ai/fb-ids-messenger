@@ -16,8 +16,12 @@ const TelegramBot = require('./services/telegram-bot');
 const SessionMonitor = require('./services/session-monitor');
 const PollScheduler = require('./services/poll-scheduler');
 const NotificationOutbox = require('./services/notification-outbox');
+const NotificationSender = require('./services/notification-sender');
+const ReplyService = require('./services/reply-service');
+const controlPlane = require('../control-plane');
 
 let mainWindow;
+let controlPlaneServer = null;
 let updaterInitialized = false;
 let updaterEnabled = false;
 let updaterState = {
@@ -192,8 +196,12 @@ app.whenReady().then(() => {
     MessageMonitor.setMainWindow(mainWindow);
     MessageMonitor.setTelegramBot(TelegramBot);
 
-    // Durable notification sender worker (Telegram delivery with retry/dead-letter)
-    NotificationOutbox.setSender((notifData, context) => TelegramBot.sendNotification(notifData, context));
+    // Durable notification sender (Expo Push primary, Telegram fallback)
+    NotificationSender.init({
+        telegramSender: (notifData, context) => TelegramBot.sendNotification(notifData, context),
+        store,
+    });
+    NotificationOutbox.setSender((notifData, context) => NotificationSender.send(notifData, context));
     NotificationOutbox.start();
 
     // Start Telegram Bot if configured
@@ -255,7 +263,6 @@ app.whenReady().then(() => {
         }
 
         // Recover any replies that were pending when the app last shut down / crashed
-        const ReplyService = require('./services/reply-service');
         await ReplyService.recoverPendingReplies();
     })();
 
@@ -265,6 +272,46 @@ app.whenReady().then(() => {
     // Start session health monitor (checks every 8 min for expired sessions + heartbeat)
     const sessionMonitor = new SessionMonitor(PlaywrightManager, Database, TelegramBot);
     sessionMonitor.start();
+
+    // Control-plane API (enabled by default — mobile app needs it)
+    try {
+        const cpDisabled = store.get('control_plane_http_disabled') === true;
+        const cpToken = (store.get('control_plane_token') || process.env.CONTROL_PLANE_TOKEN || '').trim();
+        if (!cpDisabled && cpToken) {
+            const cpPort = Number(store.get('control_plane_http_port') || process.env.CONTROL_PLANE_HTTP_PORT || 3847);
+            controlPlaneServer = controlPlane.startHttpServer({
+                port: cpPort,
+                token: cpToken,
+                getDb: () => Database.getDb(),
+                queueReplyFromCommand: (opts) => ReplyService.queueReplyFromCommand(opts),
+                syncConversation: async (accountId, conversationId) => {
+                    try {
+                        const messages = await PlaywrightManager.fetchHistory(accountId, conversationId);
+                        const db = Database.getDb();
+                        const tx = db.transaction((msgs) => {
+                            for (const m of msgs) {
+                                const id = `msg_sync_${conversationId}_${m.timestamp}_${Math.random().toString(36).substring(2, 6)}`;
+                                db.prepare(`
+                                    INSERT OR IGNORE INTO messages (id, conversation_id, account_id, sender_name, body, timestamp, is_outgoing)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                `).run(id, conversationId, accountId, m.senderName, m.body, m.timestamp, m.isOutgoing);
+                            }
+                        });
+                        tx(messages);
+                        return { ok: true, count: messages.length };
+                    } catch (err) {
+                        return { ok: false, error: err.message };
+                    }
+                }
+            });
+        } else if (!cpToken) {
+            console.log(
+                '[ControlPlane] HTTP not started — set control_plane_token in settings or CONTROL_PLANE_TOKEN env var.'
+            );
+        }
+    } catch (e) {
+        console.error('[ControlPlane] Failed to start HTTP:', e.message);
+    }
     // Expose so watchdog can clear alerts on successful relaunch
     app._sessionMonitor = sessionMonitor;
 });
@@ -272,6 +319,12 @@ app.whenReady().then(() => {
 app.on('window-all-closed', async () => {
     PollScheduler.stop();
     NotificationOutbox.stop();
+    if (controlPlaneServer) {
+        try {
+            controlPlaneServer.close();
+        } catch (_) {}
+        controlPlaneServer = null;
+    }
     await PlaywrightManager.closeAll();
     if (process.platform !== 'darwin') app.quit();
 });
@@ -493,6 +546,44 @@ ipcMain.handle('settings:get', (event, key) => {
 
 let _telegramRestartTimer = null;
 
+let _cpRestartTimer = null;
+
+function notifyControlPlaneStatus(msg) {
+    try {
+        const wins = require('electron').BrowserWindow.getAllWindows();
+        if (wins[0]) wins[0].webContents.send('control-plane:status', msg);
+    } catch (_) {}
+}
+
+function restartControlPlane() {
+    if (_cpRestartTimer) clearTimeout(_cpRestartTimer);
+    _cpRestartTimer = setTimeout(() => {
+        _cpRestartTimer = null;
+        try {
+            if (controlPlaneServer) {
+                controlPlaneServer.close();
+                controlPlaneServer = null;
+                notifyControlPlaneStatus('stopping');
+            }
+            const cpToken = (store.get('control_plane_token') || '').trim();
+            const cpPort = Number(store.get('control_plane_http_port') || 3847);
+            if (cpToken) {
+                controlPlaneServer = controlPlane.startHttpServer({
+                    port: cpPort,
+                    token: cpToken,
+                    getDb: () => Database.getDb(),
+                    queueReplyFromCommand: (opts) => ReplyService.queueReplyFromCommand(opts),
+                });
+                notifyControlPlaneStatus(`running:${cpPort}`);
+            } else {
+                notifyControlPlaneStatus('no-token');
+            }
+        } catch (err) {
+            notifyControlPlaneStatus(`error:${err.message}`);
+        }
+    }, 500);
+}
+
 ipcMain.handle('settings:save', (event, key, value) => {
     store.set(key, value);
     // Debounce bot restart — UI saves token, chatId, proxy in quick succession
@@ -511,6 +602,9 @@ ipcMain.handle('settings:save', (event, key, value) => {
                 }
             }
         }, 1500);
+    }
+    if (key === 'control_plane_token' || key === 'control_plane_http_port') {
+        restartControlPlane();
     }
 });
 
@@ -538,15 +632,40 @@ ipcMain.handle('stats:get-summary', () => {
     }
 });
 
+// Sync history from Facebook
+ipcMain.handle('conversations:sync', async (event, accountId, conversationId) => {
+    try {
+        console.log(`[Main] Syncing history for ${accountId} / ${conversationId}`);
+        const messages = await PlaywrightManager.fetchHistory(accountId, conversationId);
+        
+        const db = Database.getDb();
+        const tx = db.transaction((msgs) => {
+            for (const m of msgs) {
+                const id = `msg_sync_${conversationId}_${m.timestamp}_${Math.random().toString(36).substring(2, 6)}`;
+                db.prepare(`
+                    INSERT OR IGNORE INTO messages (id, conversation_id, account_id, sender_name, body, timestamp, is_outgoing)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `).run(id, conversationId, accountId, m.senderName, m.body, m.timestamp, m.isOutgoing);
+            }
+        });
+        tx(messages);
+        
+        return { ok: true, count: messages.length };
+    } catch (err) {
+        console.error('[Main] History sync failed:', err.message);
+        return { ok: false, error: err.message };
+    }
+});
+
 // Notifications / Messages History
 ipcMain.handle('notifications:get', () => {
     try {
         const db = Database.getDb();
         // Fetch last 50 incoming messages, using fb_name (real Facebook name) preferably
         const msgs = db.prepare(`
-            SELECT m.id, m.conversation_id, m.sender_name, m.body as messagePreview, m.timestamp,
-                   m.account_id as accountId,
-                   COALESCE(a.fb_name, a.nickname) as accountNickname
+                 SELECT m.id, m.conversation_id, m.sender_name, m.body as messagePreview, m.timestamp,
+                     m.account_id as accountId,
+                     COALESCE(NULLIF(TRIM(a.nickname), ''), NULLIF(TRIM(a.fb_name), ''), m.account_id) as accountNickname
             FROM messages m
             LEFT JOIN accounts a ON m.account_id = a.id
             WHERE m.is_outgoing = 0

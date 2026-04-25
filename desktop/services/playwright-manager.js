@@ -2,7 +2,6 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
-const { app } = require('electron');
 const { applyPlaywrightStealth, getRandomUserAgent } = require('./stealth-service');
 
 // ─── Launch arg sets ──────────────────────────────────────────────────────────
@@ -35,7 +34,12 @@ const LEAN_ARGS_HEADLESS_ONLY = [
 class PlaywrightManager {
     constructor() {
         this.contexts = new Map(); // accountId -> BrowserContext
-        this.userDataRoot = path.join(app.getPath('userData'), 'profiles');
+        if (process.env.FB_DATA_DIR) {
+            this.userDataRoot = path.join(process.env.FB_DATA_DIR, 'profiles');
+        } else {
+            const { app } = require('electron');
+            this.userDataRoot = path.join(app.getPath('userData'), 'profiles');
+        }
     }
 
     /**
@@ -88,6 +92,7 @@ class PlaywrightManager {
             headless: headless,
             viewport: { width: 1280, height: 800 },
             userAgent: this._getStableUserAgent(accountId, profileDir),
+            permissions: ['clipboard-read', 'clipboard-write'],
             args,
         };
 
@@ -189,11 +194,16 @@ class PlaywrightManager {
             const result = await page.evaluate(() => {
                 // Strategy 1: profile settings link in sidebar
                 const profileLink = document.querySelector('a[href*="/me/"], a[aria-label*="profile"], a[aria-label*="Profile"]');
-                const profileName = profileLink ? profileLink.getAttribute('aria-label') : null;
+                let profileName = profileLink ? profileLink.getAttribute('aria-label') : null;
+                if (profileName && (profileName.toLowerCase().includes('profile') || profileName.toLowerCase().includes('settings'))) {
+                    // try to get actual text if label is just "Profile"
+                    const text = profileLink.innerText.trim();
+                    if (text && text.length > 2) profileName = text;
+                }
 
                 // Strategy 2: The user menu / avatar area  
                 const avatarEl = document.querySelector('[data-testid="mwthreadlist-header"] span, div[role="banner"] span');
-                const avatarName = avatarEl ? avatarEl.textContent : null;
+                const avatarName = avatarEl ? avatarEl.textContent.trim() : null;
 
                 // Strategy 3: document title
                 const titleName = document.title && document.title !== 'Messenger' ? document.title.replace(' - Messenger', '').replace('Messenger', '').trim() : null;
@@ -217,11 +227,149 @@ class PlaywrightManager {
                 };
             });
 
+            if (result && result.fbName) {
+                // Clean up name: remove common FB suffix " (Account)" etc.
+                result.fbName = result.fbName.replace(/\s*\(.*?\)\s*/g, '').trim();
+                // Discard useless generic names the scraper picks up from page elements
+                const junk = ['facebook', 'messenger', 'profile', 'meta', 'settings', 'menu', ''];
+                if (junk.includes(result.fbName.toLowerCase())) {
+                    result.fbName = null;
+                }
+            }
+
             return result;
         } catch (err) {
             console.error(`[Playwright] Failed to extract identity for ${accountId}:`, err.message);
             return null;
         }
+    }
+
+    /**
+     * Scrape conversation history from a thread.
+     * @param {string} accountId 
+     * @param {string} conversationId 
+     * @param {number} limit 
+     */
+    async fetchHistory(accountId, conversationId, limit = 30) {
+        const page = await this.getMessengerPage(accountId);
+        
+        // Navigate if not already there
+        const urls = [
+            `https://www.facebook.com/messages/t/${conversationId}/`,
+            `https://www.facebook.com/messages/e2ee/t/${conversationId}/`
+        ];
+        
+        const currentUrl = page.url();
+        if (!currentUrl.includes(`/t/${conversationId}/`)) {
+            console.log(`[Playwright] Navigating to ${urls[0]} for history sync`);
+            await page.goto(urls[0], { waitUntil: 'domcontentloaded', timeout: 20000 });
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        // Scrape messages using selectors specific to Facebook Messenger's chat bubbles.
+        // We avoid [role="listitem"] at the top level because Facebook's sidebar / info
+        // panel also uses it for nav items like "Privacy & support", "Media and files" etc.
+        const messages = await page.evaluate((max) => {
+            // ── Junk content filter ───────────────────────────────────────────────
+            const JUNK_EXACT = new Set([
+                'privacy & support', 'media and files', 'customise chat', 'chat info',
+                'notifications', 'search in conversation', 'view profile', 'block',
+                'something went wrong', 'you are now connected on messenger',
+                'say hi to your new facebook friend', 'you sent', 'message sent',
+                'enter, message sent', 'enter', 'you', '',
+            ]);
+            const JUNK_PREFIX = [
+                'enter, message sent', 'message sent today', 'message sent yesterday',
+                'tap to retry', 'this message was deleted',
+            ];
+
+            function isJunk(text) {
+                const t = text.trim().toLowerCase();
+                if (t.length === 0 || t.length > 2000) return true;
+                if (JUNK_EXACT.has(t)) return true;
+                if (JUNK_PREFIX.some(p => t.startsWith(p))) return true;
+                // Single word system labels (FB nav) are usually short capitalised words
+                if (/^[A-Z][a-z]+$/.test(text.trim()) && text.trim().length < 20) {
+                    // But allow short real messages if they look like chat (no space needed)
+                    // Real messages are rarely single proper-cased words from a nav menu
+                    // We still allow them if they are clearly conversational (hi, ok, yes, etc)
+                    const conversational = new Set(['hi', 'ok', 'yes', 'no', 'hey', 'yo', 'bye', 'lol', 'wow']);
+                    if (!conversational.has(text.trim().toLowerCase())) {
+                        // Extra check: if it matches known FB nav labels, skip
+                        const navLabels = new Set(['files', 'links', 'photos', 'videos', 'audio',
+                            'notifications', 'privacy', 'support', 'customise', 'block', 'mute']);
+                        if (navLabels.has(t)) return true;
+                    }
+                }
+                return false;
+            }
+
+            // ── Target actual message bubbles ─────────────────────────────────────
+            // Facebook Messenger renders chat messages in a scrollable list whose
+            // items have role="row" or are nested under [aria-label*="Messages"].
+            // Bubbles themselves usually have dir="auto" text and are inside a
+            // container that has specific data-testid or structural clues.
+            const results = [];
+
+            // Strategy: find all dir="auto" text nodes inside the messages viewport,
+            // then walk up to find the row-level container.
+            const allTextEls = Array.from(document.querySelectorAll('[dir="auto"]'));
+
+            for (const textEl of allTextEls) {
+                const body = (textEl.innerText || '').trim();
+                if (isJunk(body)) continue;
+
+                // Only accept text elements inside a recognisable message container.
+                // Reject anything inside the left sidebar or info panel.
+                const inSidebar = textEl.closest('[aria-label*="Chats"], [aria-label*="Chat info"], nav, aside');
+                if (inSidebar) continue;
+
+                // Determine direction (outgoing vs incoming) by looking at flex alignment
+                // on ancestor containers. Outgoing bubbles are in flex-end rows.
+                const row = textEl.closest('[role="row"], [role="listitem"], [role="gridcell"]');
+                let isOutgoing = false;
+                if (row) {
+                    const style = window.getComputedStyle(row);
+                    isOutgoing = style.justifyContent === 'flex-end' ||
+                        row.innerText.includes('You sent') ||
+                        !!row.closest('[style*="justify-content: flex-end"]');
+                } else {
+                    // Fallback: check parent chain for flex-end
+                    let el = textEl.parentElement;
+                    for (let i = 0; i < 8 && el; i++) {
+                        const s = window.getComputedStyle(el);
+                        if (s.justifyContent === 'flex-end') { isOutgoing = true; break; }
+                        el = el.parentElement;
+                    }
+                }
+
+                // Timestamp from aria-label on a nearby time element
+                let ts = Date.now();
+                const container = row || textEl.parentElement;
+                if (container) {
+                    const timeEl = container.querySelector('[aria-label*="AM"], [aria-label*="PM"], time');
+                    if (timeEl) {
+                        const label = timeEl.getAttribute('aria-label') ||
+                                       timeEl.getAttribute('datetime') || '';
+                        const parsed = Date.parse(label);
+                        if (parsed && parsed > 0) ts = parsed;
+                    }
+                }
+
+                results.push({
+                    body,
+                    isOutgoing: isOutgoing ? 1 : 0,
+                    timestamp: ts,
+                    senderName: isOutgoing ? 'You' : null,
+                });
+
+                if (results.length >= max) break;
+            }
+
+            return results;
+        }, limit);
+
+        return messages;
     }
 }
 

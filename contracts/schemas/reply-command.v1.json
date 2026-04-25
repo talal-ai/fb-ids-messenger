@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fb-ids-messenger/contracts/reply-command.v1.json",
+  "title": "ReplyCommand v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "idempotency_key",
+    "event_id",
+    "account_id",
+    "conversation_id",
+    "message_raw",
+    "expected_conversation_version",
+    "created_at"
+  ],
+  "properties": {
+    "reply_id": {
+      "$ref": "common-types.json#/$defs/uuidLike"
+    },
+    "idempotency_key": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "event_id": {
+      "oneOf": [
+        { "$ref": "common-types.json#/$defs/uuidLike" },
+        { "type": "null" }
+      ]
+    },
+    "account_id": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "conversation_id": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "message_raw": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Literal operator text. No transform allowed."
+    },
+    "expected_conversation_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "created_at": {
+      "$ref": "common-types.json#/$defs/unixEpochMs"
+    }
+  }
+}
+

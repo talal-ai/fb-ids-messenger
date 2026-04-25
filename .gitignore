@@ -4,3 +4,9 @@ dist
 build
 release
 coverage
+.firecrawl
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/ios/
+mobile/android/

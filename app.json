@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "dbf07a4f-696e-4cad-882f-94aa19835940"
+      }
+    },
+    "android": {
+      "package": "com.veo3.multifbmanager"
+    }
+  }
+}

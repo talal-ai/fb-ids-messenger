@@ -1,20 +1,27 @@
 
 import React, { useState, useEffect } from 'react';
-import { Save, MessageCircle, Info, Send, Search } from 'lucide-react';
+import { Save, MessageCircle, Info, Send, Search, Smartphone, Copy, Check } from 'lucide-react';
 
 export default function TelegramSettings() {
+    // ── Mobile API ───────────────────────────────────────────────────────
+    const [apiToken, setApiToken] = useState('');
+    const [apiPort, setApiPort] = useState('3847');
+    const [apiStatus, setApiStatus] = useState('');
+    const [copied, setCopied] = useState(false);
+
+    // ── Telegram ─────────────────────────────────────────────────────────
     const [token, setToken] = useState('');
     const [chatId, setChatId] = useState('');
-    
+
     // Proxy detailed state
     const [proxyProtocol, setProxyProtocol] = useState('http');
     const [proxyHost, setProxyHost] = useState('');
     const [proxyPort, setProxyPort] = useState('');
     const [proxyUser, setProxyUser] = useState('');
     const [proxyPass, setProxyPass] = useState('');
-    
+
     const [status, setStatus] = useState('');
-    const [testStatus, setTestStatus] = useState({ msg: '', type: '' }); // type: 'ok' | 'err' | 'loading'
+    const [testStatus, setTestStatus] = useState({ msg: '', type: '' });
 
     const handleTest = async () => {
         if (!window.api) return;
@@ -35,83 +42,158 @@ export default function TelegramSettings() {
     };
 
     useEffect(() => {
-        if (window.api) {
-            window.api.getSetting('telegram_token').then(val => setToken(val || ''));
-            window.api.getSetting('telegram_chat_id').then(val => setChatId(val || ''));
-            
-            window.api.getSetting('telegram_proxy').then(val => {
-                if (val) {
-                    try {
-                        // Handle simple host:port case first (e.g. 1.2.3.4:8080)
-                        if (!val.includes('://') && val.includes(':')) {
-                            const parts = val.split(':');
-                            if (parts.length === 2) {
-                                setProxyHost(parts[0]);
-                                setProxyPort(parts[1]);
-                                return;
-                            }
-                        }
+        if (!window.api) return;
+        window.api.getSetting('control_plane_token').then(val => setApiToken(val || ''));
+        window.api.getSetting('control_plane_http_port').then(val => setApiPort(val || '3847'));
+        window.api.getSetting('telegram_token').then(val => setToken(val || ''));
+        window.api.getSetting('telegram_chat_id').then(val => setChatId(val || ''));
 
-                        // Handle full URLs
-                        const url = new URL(val);
-                        // Remove trailing colon from protocol if present (http: -> http)
-                        setProxyProtocol(url.protocol.replace(':', ''));
-                        setProxyHost(url.hostname);
-                        setProxyPort(url.port);
-                        setProxyUser(url.username);
-                        setProxyPass(url.password);
-                    } catch (e) {
-                        console.error("Failed to parse proxy string", e);
-                        // If it fails to parse as URL but has content, treat as Host
-                        // This allows user to overwrite "broken" strings easily
-                        if (!proxyHost) setProxyHost(val); 
+        const unsub = window.api.onControlPlaneStatus((status) => {
+            if (status === 'stopping') setApiStatus('Stopping old server...');
+            else if (status === 'no-token') setApiStatus('⚠ No token set — server not started.');
+            else if (status.startsWith('running:')) setApiStatus(`✓ Server running on port ${status.split(':')[1]}`);
+            else if (status.startsWith('error:')) setApiStatus(`✗ Error: ${status.slice(6)}`);
+        });
+        return () => { if (typeof unsub === 'function') unsub(); };
+
+        window.api.getSetting('telegram_proxy').then(val => {
+            if (val) {
+                try {
+                    if (!val.includes('://') && val.includes(':')) {
+                        const parts = val.split(':');
+                        if (parts.length === 2) {
+                            setProxyHost(parts[0]);
+                            setProxyPort(parts[1]);
+                            return;
+                        }
                     }
+                    const url = new URL(val);
+                    setProxyProtocol(url.protocol.replace(':', ''));
+                    setProxyHost(url.hostname);
+                    setProxyPort(url.port);
+                    setProxyUser(url.username);
+                    setProxyPass(url.password);
+                } catch (e) {
+                    if (!proxyHost) setProxyHost(val);
                 }
-            });
-        }
+            }
+        });
     }, []);
+
+    const handleSaveApi = async () => {
+        if (!window.api) return;
+        setApiStatus('Saving...');
+        await window.api.saveSetting('control_plane_token', apiToken.trim());
+        await window.api.saveSetting('control_plane_http_port', apiPort.trim() || '3847');
+        // status will be updated by onControlPlaneStatus listener
+    };
+
+    const handleCopyToken = () => {
+        navigator.clipboard.writeText(apiToken);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
 
     const handleSave = async () => {
         if (window.api) {
             let proxyString = '';
-            
-            // Only construct proxy string if Host AND Port are present
             if (proxyHost.trim() && proxyPort.trim()) {
                 let auth = '';
                 if (proxyUser.trim() && proxyPass.trim()) {
                     auth = `${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@`;
                 }
-                
                 const protocol = proxyProtocol.includes('sock') ? 'socks5' : 'http';
-                // Ensure no double slashes or missing parts
                 proxyString = `${protocol}://${auth}${proxyHost.trim()}:${proxyPort.trim()}`;
-            } else if (proxyHost.trim() || proxyPort.trim()) {
-                // Partial data - warn user? or just don't save faulty string
-                // For now, let's allow clearing it if both are empty
-                // If partial, maybe don't save a broken string
             }
-
             await window.api.saveSetting('telegram_token', token);
             await window.api.saveSetting('telegram_chat_id', chatId);
-            
-            // If fields are empty, we save empty string to CLEAR the setting
             await window.api.saveSetting('telegram_proxy', proxyString);
-            
             setStatus('Settings saved! Bot restarting...');
             setTimeout(() => setStatus(''), 3000);
         }
     };
 
     return (
-        <div className="p-4 max-w-3xl mx-auto">
+        <div className="p-4 max-w-3xl mx-auto space-y-4">
+
+            {/* ── Mobile API Section ───────────────────────────────────── */}
+            <div className="rounded-2xl bg-slate-900/50 backdrop-blur-sm border border-white/[0.06] p-6 shadow-glass">
+                <div className="flex items-center gap-3 mb-6">
+                    <div className="w-11 h-11 rounded-xl bg-indigo-500/15 text-indigo-400 flex items-center justify-center shrink-0">
+                        <Smartphone size={22} />
+                    </div>
+                    <div>
+                        <h2 className="text-lg font-semibold text-white">Mobile App API</h2>
+                        <p className="text-slate-500 text-sm mt-0.5">Token used by your iOS/Android app to connect</p>
+                    </div>
+                </div>
+
+                <div className="space-y-5">
+                    <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-1.5">API Token</label>
+                        <div className="flex gap-2">
+                            <input
+                                type="text"
+                                className="flex-1 bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 transition-colors font-mono"
+                                placeholder="Set a strong secret token (e.g. a random 32-char string)"
+                                value={apiToken}
+                                onChange={(e) => setApiToken(e.target.value)}
+                            />
+                            {apiToken && (
+                                <button
+                                    onClick={handleCopyToken}
+                                    className="px-3 py-2.5 bg-slate-700/80 hover:bg-slate-600 text-slate-200 rounded-xl text-sm transition-colors"
+                                    title="Copy token"
+                                >
+                                    {copied ? <Check size={16} className="text-emerald-400" /> : <Copy size={16} />}
+                                </button>
+                            )}
+                        </div>
+                        <p className="mt-1.5 text-xs text-slate-500 flex items-center gap-1">
+                            <Info size={12} /> Enter this token in the mobile app Settings screen
+                        </p>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-1.5">Port</label>
+                        <input
+                            type="text"
+                            className="w-32 bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 transition-colors"
+                            value={apiPort}
+                            onChange={(e) => setApiPort(e.target.value)}
+                        />
+                        <p className="mt-1.5 text-xs text-slate-500 flex items-center gap-1">
+                            <Info size={12} /> Mobile app URL: <code className="text-slate-400 font-mono text-xs bg-slate-800/60 px-1.5 py-0.5 rounded ml-1">http://&lt;this-PC-IP&gt;:{apiPort}</code>
+                        </p>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                        <button
+                            onClick={handleSaveApi}
+                            className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold rounded-xl flex items-center gap-2 transition-colors"
+                        >
+                            <Save size={18} />
+                            Save & Restart
+                        </button>
+                    </div>
+
+                    {apiStatus && (
+                        <div className="p-3 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 rounded-xl text-sm font-medium animate-fade-in">
+                            {apiStatus}
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* ── Telegram Section ─────────────────────────────────────── */}
             <div className="rounded-2xl bg-slate-900/50 backdrop-blur-sm border border-white/[0.06] p-6 shadow-glass">
                 <div className="flex items-center gap-3 mb-6">
                     <div className="w-11 h-11 rounded-xl bg-blue-500/15 text-blue-400 flex items-center justify-center shrink-0">
                         <MessageCircle size={22} />
                     </div>
                     <div>
-                        <h2 className="text-lg font-semibold text-white">Telegram Integration</h2>
-                        <p className="text-slate-500 text-sm mt-0.5">Connect your bot to receive and reply from your phone</p>
+                        <h2 className="text-lg font-semibold text-white">Telegram (Fallback)</h2>
+                        <p className="text-slate-500 text-sm mt-0.5">Optional — used if mobile app is unavailable</p>
                     </div>
                 </div>
 

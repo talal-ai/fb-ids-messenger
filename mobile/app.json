@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "FB Manager Mobile",
+    "slug": "multi-fb-manager",
+    "version": "1.0.0",
+    "extra": {
+      "eas": {
+        "projectId": "dbf07a4f-696e-4cad-882f-94aa19835940"
+      }
+    },
+    "orientation": "portrait",
+    "scheme": "fbmanager",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "bundleIdentifier": "com.fbmanager.mobile",
+      "supportsTablet": true
+    },
+    "android": {
+      "icon": "./assets/icon.png",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.fbmanager.mobile",
+      "softwareKeyboardLayoutMode": "pan"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#4F46E5"
+        }
+      ],
+      "expo-asset",
+      "expo-font"
+    ],
+    "owner": "veo3"
+  }
+}

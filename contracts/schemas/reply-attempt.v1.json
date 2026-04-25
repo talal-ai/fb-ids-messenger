@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fb-ids-messenger/contracts/reply-attempt.v1.json",
+  "title": "ReplyAttempt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "attempt_id",
+    "reply_id",
+    "worker_id",
+    "started_at",
+    "finished_at",
+    "status",
+    "error_code",
+    "error_detail",
+    "sent_hash"
+  ],
+  "properties": {
+    "attempt_id": {
+      "$ref": "common-types.json#/$defs/uuidLike"
+    },
+    "reply_id": {
+      "$ref": "common-types.json#/$defs/uuidLike"
+    },
+    "worker_id": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "started_at": {
+      "$ref": "common-types.json#/$defs/unixEpochMs"
+    },
+    "finished_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "claimed",
+        "sending",
+        "sent",
+        "failed_retryable",
+        "dead_letter",
+        "cancelled"
+      ]
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error_detail": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sent_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}
+

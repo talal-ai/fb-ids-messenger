@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fb-ids-messenger/contracts/inbound-event.v1.json",
+  "title": "InboundEvent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "account_id",
+    "conversation_id",
+    "sender_name",
+    "body_raw",
+    "detected_at",
+    "detector_source",
+    "event_hash"
+  ],
+  "properties": {
+    "event_id": {
+      "$ref": "common-types.json#/$defs/uuidLike"
+    },
+    "account_id": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "conversation_id": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "sender_name": {
+      "$ref": "common-types.json#/$defs/nonEmptyString"
+    },
+    "body_raw": {
+      "type": "string",
+      "minLength": 1
+    },
+    "detected_at": {
+      "$ref": "common-types.json#/$defs/unixEpochMs",
+      "description": "Epoch milliseconds (locked format for v1)."
+    },
+    "detector_source": {
+      "type": "string",
+      "enum": [
+        "sidebar",
+        "network",
+        "notification-api",
+        "post-reply-reconcile",
+        "manual-replay"
+      ]
+    },
+    "event_hash": {
+      "$ref": "common-types.json#/$defs/sha256Hex"
+    }
+  }
+}
+

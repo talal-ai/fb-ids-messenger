@@ -1,0 +1,10 @@
+{
+  "reply_id": "rpl_01J1QWERTY9XYZ",
+  "event_id": "evt_01J1ABCDEF9XYZ",
+  "account_id": "acc_1710000000000",
+  "conversation_id": "1000000123456789",
+  "message_raw": "Please share invoice copy.",
+  "expected_conversation_version": null,
+  "created_at": 1712534405123
+}
+

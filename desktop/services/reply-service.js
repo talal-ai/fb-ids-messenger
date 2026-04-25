@@ -12,10 +12,12 @@
  * any replies that were pending when the app last died.
  */
 
+const crypto = require('crypto');
 const PlaywrightManager = require('./playwright-manager');
 const MessageMonitor = require('./message-monitor');
 const Database = require('../db/database');
 const NotificationOutbox = require('./notification-outbox');
+const { sha256Utf8 } = require('../../control-plane/lib/hashes');
 
 const MESSENGER_BASE = 'https://www.facebook.com/messages';
 const NAV_TIMEOUT = 20_000;      // 20s to load conversation page
@@ -25,6 +27,29 @@ const RETRY_BASE_MS = 10_000;    // 10s, 20s, 30s backoff
 
 // In-memory processing lock per account (not durable — just prevents concurrent sends)
 const processingLocks = new Set(); // accountId
+
+const WORKER_ID = `electron-${process.pid}`;
+
+function startAttempt(db, replyJobId, replyId) {
+    // reply_job_id may be null if join failed — skip ledger
+    if (!replyJobId) return null;
+    const attemptId = crypto.randomUUID();
+    const now = Date.now();
+    db.prepare(`
+        INSERT INTO reply_attempts (attempt_id, reply_job_id, reply_id, worker_id, started_at, finished_at, status, error_code, error_detail, sent_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, NULL, 'sending', NULL, NULL, NULL, ?)
+    `).run(attemptId, replyJobId, replyId || null, WORKER_ID, now, now);
+    return attemptId;
+}
+
+function finishAttempt(db, attemptId, status, errorCode, errorDetail, sentHash) {
+    if (!attemptId) return;
+    db.prepare(`
+        UPDATE reply_attempts
+        SET finished_at = ?, status = ?, error_code = ?, error_detail = ?, sent_hash = ?
+        WHERE attempt_id = ?
+    `).run(Date.now(), status, errorCode || null, errorDetail || null, sentHash || null, attemptId);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -41,6 +66,8 @@ function queueReply(accountId, conversationId, message) {
         try {
             const db = Database.getDb();
             const now = Date.now();
+            const replyId = crypto.randomUUID();
+            const messageHash = sha256Utf8(message);
             const tx = db.transaction(() => {
                 const result = db.prepare(`
                     INSERT INTO reply_queue (account_id, conversation_id, message, status, attempts, created_at, next_attempt_at)
@@ -50,11 +77,11 @@ function queueReply(accountId, conversationId, message) {
                 // Dual-write into durable reply_jobs (new pipeline path) while legacy queue remains active.
                 db.prepare(`
                     INSERT INTO reply_jobs
-                        (legacy_queue_id, account_id, conversation_id, message_text, source, status, attempts, max_attempts,
+                        (legacy_queue_id, reply_id, message_hash, account_id, conversation_id, message_text, source, status, attempts, max_attempts,
                          next_attempt_at, created_at, updated_at)
                     VALUES
-                        (?, ?, ?, ?, 'telegram', 'queued', 0, ?, ?, ?, ?)
-                `).run(Number(result.lastInsertRowid), accountId, conversationId, message, MAX_ATTEMPTS, now, now, now);
+                        (?, ?, ?, ?, ?, ?, 'telegram', 'queued', 0, ?, ?, ?, ?)
+                `).run(Number(result.lastInsertRowid), replyId, messageHash, accountId, conversationId, message, MAX_ATTEMPTS, now, now, now);
 
                 return result;
             });
@@ -72,6 +99,82 @@ function queueReply(accountId, conversationId, message) {
         } catch (err) {
             console.error(`[ReplyService] Failed to queue reply:`, err.message);
             resolve({ success: false, reason: `db-error: ${err.message}` });
+        }
+    });
+}
+
+/**
+ * API / control-plane path: durable queue with idempotency + canonical reply_id.
+ * @returns {Promise<{ ok: boolean, reply_job_id?: number, legacy_queue_id?: number, reason?: string }>}
+ */
+function queueReplyFromCommand(opts) {
+    const {
+        replyId,
+        idempotencyKey,
+        eventId,
+        accountId,
+        conversationId,
+        messageRaw,
+        messageHash,
+        expectedConversationVersion,
+    } = opts;
+
+    return new Promise((resolve) => {
+        try {
+            const db = Database.getDb();
+            const now = Date.now();
+            const tx = db.transaction(() => {
+                const result = db.prepare(`
+                    INSERT INTO reply_queue (account_id, conversation_id, message, status, attempts, created_at, next_attempt_at)
+                    VALUES (?, ?, ?, 'pending', 0, ?, ?)
+                `).run(accountId, conversationId, messageRaw, now, now);
+
+                const qid = Number(result.lastInsertRowid);
+
+                db.prepare(`
+                    INSERT INTO reply_jobs
+                        (legacy_queue_id, reply_id, idempotency_key, event_id, message_hash, expected_conversation_version,
+                         account_id, conversation_id, message_text, source, status, attempts, max_attempts,
+                         next_attempt_at, created_at, updated_at)
+                    VALUES
+                        (?, ?, ?, ?, ?, ?, ?, ?, ?, 'api', 'queued', 0, ?, ?, ?, ?)
+                `).run(
+                    qid,
+                    replyId,
+                    idempotencyKey,
+                    eventId,
+                    messageHash,
+                    expectedConversationVersion == null ? null : expectedConversationVersion,
+                    accountId,
+                    conversationId,
+                    messageRaw,
+                    MAX_ATTEMPTS,
+                    now,
+                    now,
+                    now
+                );
+
+                const jobRow = db.prepare('SELECT id FROM reply_jobs WHERE legacy_queue_id = ?').get(qid);
+                return { qid, reply_job_id: jobRow ? jobRow.id : null };
+            });
+
+            const { qid, reply_job_id } = tx();
+            console.log(`[ReplyService] API queued reply ${replyId} queue=${qid} job=${reply_job_id}`);
+
+            processQueue(accountId, qid, (r) => {
+                resolve({
+                    ok: r && r.success !== false,
+                    reply_job_id,
+                    legacy_queue_id: qid,
+                    reason: r && r.reason,
+                });
+            }).catch((err) => {
+                console.error('[ReplyService] processQueue error:', err.message);
+                resolve({ ok: false, reason: `queue-error: ${err.message}` });
+            });
+        } catch (err) {
+            console.error('[ReplyService] queueReplyFromCommand failed:', err.message);
+            resolve({ ok: false, reason: err.message });
         }
     });
 }
@@ -122,9 +225,22 @@ async function processQueue(accountId, targetRowId, resolve) {
         while (true) {
             const db = Database.getDb();
             const row = db.prepare(`
-                SELECT * FROM reply_queue
-                WHERE account_id = ? AND status = 'pending' AND next_attempt_at <= ?
-                ORDER BY id ASC LIMIT 1
+                SELECT
+                    rq.id,
+                    rq.account_id,
+                    rq.conversation_id,
+                    rq.message,
+                    rq.status,
+                    rq.attempts,
+                    rq.created_at,
+                    rq.next_attempt_at,
+                    rj.id AS reply_job_id,
+                    rj.message_hash AS job_message_hash,
+                    rj.reply_id AS job_reply_id
+                FROM reply_queue rq
+                LEFT JOIN reply_jobs rj ON rj.legacy_queue_id = rq.id
+                WHERE rq.account_id = ? AND rq.status = 'pending' AND rq.next_attempt_at <= ?
+                ORDER BY rq.id ASC LIMIT 1
             `).get(accountId, Date.now());
 
             if (!row) break; // Queue empty (or all items are deferred)
@@ -135,22 +251,67 @@ async function processQueue(accountId, targetRowId, resolve) {
                 WHERE legacy_queue_id = ?
             `).run(Date.now(), Date.now(), row.id);
 
-            const result = await executeReply(accountId, row.conversation_id, row.message);
+            const attemptId = startAttempt(db, row.reply_job_id, row.job_reply_id);
+
+            const result = await executeReply(accountId, row.conversation_id, row.message, {
+                messageHash: row.job_message_hash,
+            });
 
             if (result.success) {
+                const sentHash = row.job_message_hash || sha256Utf8(row.message);
+                finishAttempt(db, attemptId, 'sent', null, null, sentHash);
                 db.prepare(`UPDATE reply_queue SET status = 'sent' WHERE id = ?`).run(row.id);
                 db.prepare(`
                     UPDATE reply_jobs
-                    SET status = 'sent', completed_at = ?, updated_at = ?
+                    SET status = 'sent', completed_at = ?, updated_at = ?, error_code = NULL
                     WHERE legacy_queue_id = ?
                 `).run(Date.now(), Date.now(), row.id);
                 console.log(`[ReplyService] Reply #${row.id} sent successfully`);
-                // Resolve caller if this was their row
                 if (resolve && row.id === targetRowId) {
                     resolve({ success: true });
                     resolve = null;
                 }
+            } else if (result.terminal) {
+                finishAttempt(
+                    db,
+                    attemptId,
+                    'dead_letter',
+                    result.errorCode || 'terminal',
+                    result.reason,
+                    null
+                );
+                db.prepare(`UPDATE reply_queue SET status = 'failed', attempts = ? WHERE id = ?`).run(row.attempts + 1, row.id);
+                db.prepare(`
+                    UPDATE reply_jobs
+                    SET status = 'dead_letter', attempts = ?, completed_at = ?, updated_at = ?, last_error = ?, error_code = ?
+                    WHERE legacy_queue_id = ?
+                `).run(
+                    row.attempts + 1,
+                    Date.now(),
+                    Date.now(),
+                    result.reason || 'terminal',
+                    result.errorCode || 'terminal',
+                    row.id
+                );
+                console.error(`[ReplyService] Reply #${row.id} terminal failure: ${result.reason}`);
+                try {
+                    NotificationOutbox.enqueue(
+                        {
+                            senderName: '❌ Reply Failed',
+                            body: `${result.reason}\nMsg: ${row.message.substring(0, 80)}`,
+                            accountId,
+                            accountLabel: accountId,
+                            timestamp: Date.now(),
+                        },
+                        null
+                    );
+                } catch (_) {}
+                if (resolve && row.id === targetRowId) {
+                    resolve({ success: false, reason: result.reason });
+                    resolve = null;
+                }
             } else {
+                finishAttempt(db, attemptId, 'failed_retryable', null, result.reason, null);
                 const newAttempts = row.attempts + 1;
                 if (newAttempts >= MAX_ATTEMPTS) {
                     db.prepare(`UPDATE reply_queue SET status = 'failed', attempts = ? WHERE id = ?`).run(newAttempts, row.id);
@@ -160,7 +321,6 @@ async function processQueue(accountId, targetRowId, resolve) {
                         WHERE legacy_queue_id = ?
                     `).run(newAttempts, Date.now(), Date.now(), result.reason || 'max-attempts-exceeded', row.id);
                     console.error(`[ReplyService] Reply #${row.id} FAILED after ${MAX_ATTEMPTS} attempts: ${result.reason}`);
-                    // Alert operator via Telegram
                     try {
                         NotificationOutbox.enqueue(
                             {
@@ -187,18 +347,15 @@ async function processQueue(accountId, targetRowId, resolve) {
                         WHERE legacy_queue_id = ?
                     `).run(newAttempts, nextAttemptAt, Date.now(), result.reason || 'retry-scheduled', row.id);
                     console.warn(`[ReplyService] Reply #${row.id} attempt ${newAttempts} failed — retrying in ${RETRY_BASE_MS * newAttempts / 1000}s`);
-                    // Don't resolve yet — will retry on next process cycle
                     if (resolve && row.id === targetRowId) {
-                        // Schedule a re-check after the backoff delay
                         setTimeout(() => {
                             processQueue(accountId, targetRowId, resolve).catch(() => {});
                         }, RETRY_BASE_MS * newAttempts + 500);
-                        resolve = null; // Transfer ownership to the delayed call
+                        resolve = null;
                     }
                 }
             }
 
-            // Minimum gap between replies on the same account
             await sleep(MIN_REPLY_GAP_MS);
         }
     } finally {
@@ -245,7 +402,10 @@ function _waitForRow(rowId, resolve) {
 // Core reply execution: navigate → type → send → navigate back
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function executeReply(accountId, conversationId, message) {
+/**
+ * @param {{ messageHash?: string | null }} [meta]
+ */
+async function executeReply(accountId, conversationId, message, meta) {
     const page = await PlaywrightManager.getMessengerPage(accountId);
     if (!page) {
         return { success: false, reason: `Account ${accountId} not found or page not available` };
@@ -308,7 +468,23 @@ async function executeReply(accountId, conversationId, message) {
         return { success: false, reason: `navigation-failed: ${errMsg}` };
     }
 
-    // Step 2: Click textbox, type, and send
+    // Literal-send verification (immutable payload) — fail closed before typing
+    if (meta && meta.messageHash) {
+        const h = sha256Utf8(message);
+        if (h !== meta.messageHash) {
+            console.error(`[ReplyService] literal_hash_mismatch expected=${meta.messageHash} actual=${h}`);
+            unlockReply();
+            await safeNavigateBack(page);
+            return {
+                success: false,
+                reason: 'literal_hash_mismatch',
+                terminal: true,
+                errorCode: 'literal_hash_mismatch',
+            };
+        }
+    }
+
+    // Step 2: Click textbox, paste message, and send
     try {
         const textbox = await page.$(TEXTBOX_SELECTOR);
         if (!textbox) {
@@ -319,7 +495,7 @@ async function executeReply(accountId, conversationId, message) {
         await textbox.click();
         await sleep(300);
 
-        // Verify focus is still in the textbox before typing
+        // Verify focus is still in the textbox before pasting
         const focused = await page.evaluate(() =>
             document.activeElement && document.activeElement.getAttribute('contenteditable') === 'true'
         );
@@ -328,15 +504,18 @@ async function executeReply(accountId, conversationId, message) {
             await sleep(200);
         }
 
-        // Type with human-like delays
-        await page.keyboard.type(message, { delay: 40 + Math.random() * 40 });
+        // Copy-paste: write message to clipboard, then Ctrl+V
+        await page.evaluate((text) => navigator.clipboard.writeText(text), message);
+        await page.keyboard.down('Control');
+        await page.keyboard.press('v');
+        await page.keyboard.up('Control');
         await sleep(500);
 
         await page.keyboard.press('Enter');
         console.log(`[ReplyService] Message sent on ${accountId} to ${conversationId}`);
         await sleep(1000);
     } catch (err) {
-        console.error(`[ReplyService] Typing/sending failed:`, err.message);
+        console.error(`[ReplyService] Send failed:`, err.message);
         unlockReply();
         await safeNavigateBack(page);
         return { success: false, reason: `send-failed: ${err.message}` };
@@ -365,4 +544,4 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { queueReply, recoverPendingReplies };
+module.exports = { queueReply, queueReplyFromCommand, recoverPendingReplies };

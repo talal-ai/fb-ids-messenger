@@ -1,0 +1,12 @@
+{
+  "attempt_id": "att_01J1ZXCVBN9XYZ",
+  "reply_id": "rpl_01J1QWERTY9XYZ",
+  "worker_id": "engine-worker-01",
+  "started_at": 1712534410000,
+  "finished_at": null,
+  "status": "in_progress",
+  "error_code": null,
+  "error_detail": null,
+  "sent_hash": null
+}
+

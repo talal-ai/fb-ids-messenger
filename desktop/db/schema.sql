@@ -31,11 +31,6 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
 CREATE TABLE IF NOT EXISTS reply_context (
     telegram_msg_id  INTEGER PRIMARY KEY,
     account_id       TEXT NOT NULL,
@@ -75,6 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_reply_queue_pending ON reply_queue(status, next_a
 CREATE TABLE IF NOT EXISTS inbound_events (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key        TEXT NOT NULL UNIQUE,
+    event_id         TEXT,
+    event_hash       TEXT,
     account_id       TEXT NOT NULL,
     conversation_id  TEXT,
     sender_name      TEXT,
@@ -88,6 +85,7 @@ CREATE TABLE IF NOT EXISTS inbound_events (
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_events_status_time ON inbound_events(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbound_events_account_time ON inbound_events(account_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_events_event_id ON inbound_events(event_id) WHERE event_id IS NOT NULL AND event_id != '';
 
 -- Telegram notification outbox for crash-safe retries
 CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -117,10 +115,16 @@ CREATE INDEX IF NOT EXISTS idx_notification_outbox_account_time ON notification_
 CREATE TABLE IF NOT EXISTS reply_jobs (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     legacy_queue_id       INTEGER,
+    reply_id              TEXT,
+    idempotency_key       TEXT,
+    event_id              TEXT,
+    message_hash          TEXT,
+    expected_conversation_version INTEGER,
+    error_code            TEXT,
     account_id            TEXT NOT NULL,
     conversation_id       TEXT NOT NULL,
     message_text          TEXT NOT NULL,
-    source                TEXT DEFAULT 'telegram',  -- telegram | manual | replay
+    source                TEXT DEFAULT 'telegram',  -- telegram | manual | replay | api
     status                TEXT DEFAULT 'queued',    -- queued | in_progress | sent | failed | dead_letter
     attempts              INTEGER DEFAULT 0,
     max_attempts          INTEGER DEFAULT 3,
@@ -135,6 +139,27 @@ CREATE TABLE IF NOT EXISTS reply_jobs (
 CREATE INDEX IF NOT EXISTS idx_reply_jobs_pending ON reply_jobs(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_reply_jobs_account_time ON reply_jobs(account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reply_jobs_legacy_queue ON reply_jobs(legacy_queue_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_jobs_idempotency ON reply_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_jobs_reply_id ON reply_jobs(reply_id) WHERE reply_id IS NOT NULL AND reply_id != '';
+
+-- Append-only execution attempts for reply_jobs (maps to ReplyAttempt v1)
+CREATE TABLE IF NOT EXISTS reply_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL UNIQUE,
+    reply_job_id INTEGER NOT NULL,
+    reply_id TEXT,
+    worker_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    status TEXT NOT NULL,
+    error_code TEXT,
+    error_detail TEXT,
+    sent_hash TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (reply_job_id) REFERENCES reply_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_reply_attempts_job ON reply_attempts(reply_job_id);
+CREATE INDEX IF NOT EXISTS idx_reply_attempts_reply_id ON reply_attempts(reply_id);
 
 -- Terminal failures for replay/inspection
 CREATE TABLE IF NOT EXISTS dead_letters (
@@ -149,3 +174,13 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 );
 CREATE INDEX IF NOT EXISTS idx_dead_letters_table_id ON dead_letters(source_table, source_id);
 CREATE INDEX IF NOT EXISTS idx_dead_letters_account_time ON dead_letters(account_id, created_at DESC);
+
+-- Expo push notification device tokens (mobile app)
+CREATE TABLE IF NOT EXISTS device_tokens (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    token      TEXT UNIQUE NOT NULL,
+    platform   TEXT DEFAULT 'ios',
+    label      TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);

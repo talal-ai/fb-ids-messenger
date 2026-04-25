@@ -1,0 +1,33 @@
+{
+  "algorithm": "sha256",
+  "encoding": "utf8",
+  "normalization": "none",
+  "vectors": [
+    {
+      "name": "ascii_simple",
+      "input": "Hello",
+      "sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "name": "multiline_lf",
+      "input": "Line1\nLine2",
+      "sha256": "634a9a085cdd50446f84ab95bc6a7253120cf1e1522e5f0aaa9f65137776ec17"
+    },
+    {
+      "name": "leading_trailing_spaces",
+      "input": "  spaced  ",
+      "sha256": "1dcc24a14a6bf8cb4d91752a98db8ffc259e37156903a780f826c24de61e2a05"
+    },
+    {
+      "name": "unicode_emoji",
+      "input": "emoji🙂",
+      "sha256": "0a86953ae5e56d6ce5acc30a2dd7de397e9ec86155f458cce3d6ce5435b85ffe"
+    },
+    {
+      "name": "empty_string_reference",
+      "input": "",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
+

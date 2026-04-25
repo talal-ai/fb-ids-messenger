@@ -105,30 +105,4 @@ async function applyPlaywrightStealth(context) {
     }
 }
 
-/**
- * @deprecated Use applyPlaywrightStealth() for Playwright contexts.
- * Applies stealth settings to an Electron BrowserView.
- * @param {BrowserView} view
- */
-function applyStealth(view) {
-    const ua = getRandomUserAgent();
-    view.webContents.setUserAgent(ua);
-
-    view.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
-        details.requestHeaders['Accept-Language'] = 'en-US,en;q=0.9';
-        delete details.requestHeaders['X-Electron'];
-        callback({ requestHeaders: details.requestHeaders });
-    });
-
-    view.webContents.on('dom-ready', async () => {
-        try {
-            await view.webContents.executeJavaScript(getStealthScript());
-        } catch (e) {
-            console.error("Failed to inject stealth scripts:", e);
-        }
-    });
-
-    view.webContents.setBackgroundThrottling(false);
-}
-
-module.exports = { applyStealth, applyPlaywrightStealth, getRandomUserAgent };
+module.exports = { applyPlaywrightStealth, getRandomUserAgent };

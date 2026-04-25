@@ -42,7 +42,7 @@ export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAcco
           <form onSubmit={handleSubmit} className="flex flex-wrap gap-3">
             <input
               type="text"
-              placeholder="Nickname (e.g. Personal, Business)"
+              placeholder="Profile Name (e.g. Personal, Business, Client-A)"
               className="flex-1 min-w-[200px] bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-colors"
               value={nickname}
               onChange={(e) => setNickname(e.target.value)}
@@ -72,10 +72,10 @@ export default function ActiveAccounts({ accounts, onAddAccount, onTerminateAcco
             >
               <div className="flex justify-between items-start gap-3 mb-4">
                 <div className="min-w-0 flex-1">
-                  <h4 className="font-semibold text-white truncate">{acc.fb_name || acc.nickname || 'Session'}</h4>
-                  {acc.fb_name && acc.nickname && <p className="text-xs text-slate-500 mt-0.5 truncate">{acc.nickname}</p>}
+                  <h4 className="font-semibold text-white truncate">{acc.nickname || acc.fb_name || 'Session'}</h4>
+                  {acc.fb_name && acc.fb_name !== acc.nickname && <p className="text-xs text-slate-500 mt-0.5 truncate">FB: {acc.fb_name}</p>}
                   <p className="text-[11px] text-slate-600 font-mono mt-1 truncate">{acc.id}</p>
-                  {acc.fb_user_id && <p className="text-[11px] text-blue-400/70 font-mono mt-0.5 truncate">FB: {acc.fb_user_id}</p>}
+                  {acc.fb_user_id && <p className="text-[11px] text-blue-400/70 font-mono mt-0.5 truncate">FB ID: {acc.fb_user_id}</p>}
                 </div>
                 <span
                   className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium border ${

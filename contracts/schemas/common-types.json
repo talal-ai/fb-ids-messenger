@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fb-ids-messenger/contracts/common-types.v1.json",
+  "title": "Common Contract Types v1",
+  "type": "object",
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "unixEpochMs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "uuidLike": {
+      "type": "string",
+      "minLength": 8
+    }
+  }
+}
+

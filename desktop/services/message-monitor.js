@@ -3,6 +3,7 @@ const Database = require('../db/database');
 const PollScheduler = require('./poll-scheduler');
 const crypto = require('crypto');
 const NotificationOutbox = require('./notification-outbox');
+const { computeInboundEventHash } = require('../../control-plane/lib/hashes');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dedup: ignore same sender+body within 30 s sliding window
@@ -75,6 +76,18 @@ function buildEventKey(accountId, conversationId, senderName, body, ts) {
     const bucket = Math.floor((ts || Date.now()) / 5000);
     const raw = `${accountId}|${conv}|${sender}|${msg}|${bucket}`;
     return crypto.createHash('sha1').update(raw).digest('hex');
+}
+
+/** Map raw detector labels to InboundEvent v1 `detector_source` enum. */
+function mapDetectorSource(detectedBy) {
+    const m = {
+        'sidebar-poll': 'sidebar',
+        'sidebar-poll-no-preview': 'sidebar',
+        'sidebar-post-reply-reconcile': 'post-reply-reconcile',
+        'network-intercept': 'network',
+        'notification-api': 'notification-api',
+    };
+    return m[detectedBy] || 'sidebar';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -420,7 +433,7 @@ class MessageMonitor {
                     try {
                         acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
                     } catch (_) { acc = null; }
-                    let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
+                    let label = (acc && (acc.nickname || acc.fb_name)) || accountId;
                     label = label.replace(/^\(\d+\+?\)\s*/, '');
                     const replyCtx = { accountId, conversationId: chat.convId, senderName: entry.senderName, accountLabel: label };
                     NotificationOutbox.enqueue(
@@ -622,6 +635,16 @@ class MessageMonitor {
 
         try {
             const eventKey = buildEventKey(accountId, threadId, senderName, body, ts);
+            const detectorSource = mapDetectorSource(detectedBy);
+            const eventId = crypto.randomUUID();
+            const eventHash = computeInboundEventHash({
+                account_id: accountId,
+                conversation_id: threadId,
+                sender_name: senderName,
+                body_raw: body,
+                detected_at: ts,
+                detector_source: detectorSource,
+            });
 
             // Wrap inserts in one transaction. If inbound event already exists,
             // we skip all downstream work for this logical message.
@@ -629,9 +652,9 @@ class MessageMonitor {
             const insertTx = db.transaction(() => {
                 const eventResult = db.prepare(`
                     INSERT OR IGNORE INTO inbound_events
-                        (event_key, account_id, conversation_id, sender_name, body, detected_by, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)
-                `).run(eventKey, accountId, threadId, senderName, body, detectedBy, ts, Date.now());
+                        (event_key, event_id, event_hash, account_id, conversation_id, sender_name, body, detected_by, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                `).run(eventKey, eventId, eventHash, accountId, threadId, senderName, body, detectedBy, ts, Date.now());
 
                 if (eventResult.changes === 0) {
                     return null;
@@ -639,13 +662,14 @@ class MessageMonitor {
                 inboundEventId = Number(eventResult.lastInsertRowid);
 
                 db.prepare(`
-                    INSERT INTO conversations (id, account_id, last_message, last_message_at, unread_count)
-                    VALUES (?, ?, ?, ?, 1)
+                    INSERT INTO conversations (id, account_id, participant_name, last_message, last_message_at, unread_count)
+                    VALUES (?, ?, ?, ?, ?, 1)
                     ON CONFLICT(id) DO UPDATE SET
+                        participant_name = COALESCE(excluded.participant_name, conversations.participant_name),
                         last_message = excluded.last_message,
                         last_message_at = excluded.last_message_at,
                         unread_count = unread_count + 1
-                `).run(threadId, accountId, body, ts);
+                `).run(threadId, accountId, senderName || null, body, ts);
 
                 db.prepare(`
                     INSERT INTO messages (id, conversation_id, account_id, sender_name, body, timestamp, is_outgoing)
@@ -685,7 +709,7 @@ class MessageMonitor {
             try {
                 acc = db.prepare('SELECT nickname, fb_name FROM accounts WHERE id = ?').get(accountId);
             } catch (_) { acc = null; }
-            let label = (acc && (acc.fb_name || acc.nickname)) || accountId;
+            let label = (acc && (acc.nickname || acc.fb_name)) || accountId;
             label = label.replace(/^\(\d+\+?\)\s*/, '');
 
             const isRealConvId = threadId && !threadId.startsWith('unknown_');

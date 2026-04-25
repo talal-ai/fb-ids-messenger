@@ -2,13 +2,20 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const { app } = require('electron');
+// electron is optional — headless (VPS) mode uses FB_DATA_DIR env var instead
+let _electronApp = null;
+function getElectronApp() {
+    if (!_electronApp) _electronApp = require('electron').app;
+    return _electronApp;
+}
+const { applyPhase2Migrations } = require('./migrations-phase2');
 
 let db;
 
 function initDatabase() {
-    const userDataPath = app.getPath('userData');
-    const dbPath = path.join(userDataPath, 'messenger.db');
+    const dbPath = process.env.FB_DATA_DIR
+        ? path.join(process.env.FB_DATA_DIR, 'messenger.db')
+        : path.join(getElectronApp().getPath('userData'), 'messenger.db');
 
     console.log('[DB] Connecting to SQLite at:', dbPath);
     db = new Database(dbPath);
@@ -41,6 +48,8 @@ function initDatabase() {
     } catch (e) {
         console.error('[DB] Failed to update schema version:', e.message);
     }
+
+    applyPhase2Migrations(db);
 
     // Migrations: add columns if missing
     try {

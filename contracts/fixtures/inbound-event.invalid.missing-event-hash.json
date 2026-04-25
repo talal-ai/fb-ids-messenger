@@ -1,0 +1,10 @@
+{
+  "event_id": "evt_01J1ABCDEF9XYZ",
+  "account_id": "acc_1710000000000",
+  "conversation_id": "1000000123456789",
+  "sender_name": "Alice Example",
+  "body_raw": "hello from inbox",
+  "detected_at": 1712534400000,
+  "detector_source": "sidebar"
+}
+
