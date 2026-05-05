@@ -30,6 +30,13 @@ function initDatabase() {
     // Better write throughput under concurrent worker updates
     db.pragma('synchronous = NORMAL');
 
+    // Phase-2 column ALTERs MUST run before schema.sql, because schema.sql
+    // creates indexes on those columns (event_id, idempotency_key, reply_id).
+    // On legacy installs the columns don't exist yet, so the index would crash
+    // initDatabase with "no such column: event_id". Phase-2 internally guards
+    // on `cols.length > 0`, so it's a safe no-op for fresh installs.
+    applyPhase2Migrations(db);
+
     // Load schema
     const schemaPath = path.join(__dirname, 'schema.sql');
     if (fs.existsSync(schemaPath)) {
@@ -48,8 +55,6 @@ function initDatabase() {
     } catch (e) {
         console.error('[DB] Failed to update schema version:', e.message);
     }
-
-    applyPhase2Migrations(db);
 
     // Migrations: add columns if missing
     try {

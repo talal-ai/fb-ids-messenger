@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { Save, MessageCircle, Info, Send, Search, Smartphone, Copy, Check } from 'lucide-react';
+import { Save, MessageCircle, Info, Send, Search, Smartphone, Copy, Check, RefreshCw } from 'lucide-react';
 
 export default function TelegramSettings() {
     // ── Mobile API ───────────────────────────────────────────────────────
@@ -94,6 +94,17 @@ export default function TelegramSettings() {
         setTimeout(() => setCopied(false), 2000);
     };
 
+    const handleGenerateToken = () => {
+        // 16 random bytes → 32 hex chars. crypto.getRandomValues is the
+        // browser-standard CSPRNG and is available in Electron renderers.
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        const token = Array.from(bytes)
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+        setApiToken(token);
+    };
+
     const handleSave = async () => {
         if (window.api) {
             let proxyString = '';
@@ -135,10 +146,18 @@ export default function TelegramSettings() {
                             <input
                                 type="text"
                                 className="flex-1 bg-slate-800/80 border border-white/[0.08] rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 transition-colors font-mono"
-                                placeholder="Set a strong secret token (e.g. a random 32-char string)"
+                                placeholder="Click Generate to create a secure token"
                                 value={apiToken}
                                 onChange={(e) => setApiToken(e.target.value)}
                             />
+                            <button
+                                onClick={handleGenerateToken}
+                                className="px-3 py-2.5 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 rounded-xl text-sm font-medium transition-colors flex items-center gap-1.5 border border-indigo-500/20"
+                                title="Generate a new 32-character random token"
+                            >
+                                <RefreshCw size={14} />
+                                Generate
+                            </button>
                             {apiToken && (
                                 <button
                                     onClick={handleCopyToken}
@@ -150,7 +169,7 @@ export default function TelegramSettings() {
                             )}
                         </div>
                         <p className="mt-1.5 text-xs text-slate-500 flex items-center gap-1">
-                            <Info size={12} /> Enter this token in the mobile app Settings screen
+                            <Info size={12} /> Click <span className="text-indigo-400 font-medium">Generate</span> for a fresh token, then <span className="text-slate-300 font-medium">Save &amp; Restart</span>. Paste the same token into your mobile app's Settings screen.
                         </p>
                     </div>
 

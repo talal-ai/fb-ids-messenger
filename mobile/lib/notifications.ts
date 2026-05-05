@@ -2,7 +2,7 @@ import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 import { registerDeviceToken } from './api';
-import { setPushToken } from './storage';
+import { getPushToken, setPushToken } from './storage';
 
 let handlerConfigured = false;
 
@@ -20,6 +20,8 @@ async function ensureNotificationHandler(): Promise<void> {
     Notifications.setNotificationHandler({
         handleNotification: async () => ({
             shouldShowAlert: true,
+            shouldShowBanner: true,
+            shouldShowList: true,
             shouldPlaySound: true,
             shouldSetBadge: true,
         }),
@@ -75,7 +77,19 @@ export async function setupPushNotifications(): Promise<string | null> {
         return null;
     }
 
-    const tokenObj = await Notifications.getExpoPushTokenAsync({ projectId });
+    let tokenObj;
+    try {
+        tokenObj = await Notifications.getExpoPushTokenAsync({ projectId });
+    } catch (err) {
+        const msg = String((err as { message?: string } | undefined)?.message || err || '');
+        if (Platform.OS === 'android' && msg.includes('Default FirebaseApp is not initialized')) {
+            console.error(
+                '[Push] Firebase is not initialized. Add google-services.json in mobile/ or set GOOGLE_SERVICES_JSON, then rebuild Android app.'
+            );
+            return null;
+        }
+        throw err;
+    }
 
     const token = tokenObj.data;
     console.log('[Push] Expo push token:', token);
@@ -90,6 +104,50 @@ export async function setupPushNotifications(): Promise<string | null> {
     }
 
     return token;
+}
+
+export async function syncPushTokenWithBackend(): Promise<boolean> {
+    if (isAndroidExpoGo() || !Device.isDevice) {
+        return false;
+    }
+
+    // Re-mint the token from the OS — on Android it can rotate after reinstall,
+    // app-data clear, OS update, or Google Play Services refresh. Sending the
+    // cached token in those cases = silent delivery failure.
+    const projectId =
+        Constants.expoConfig?.extra?.eas?.projectId ??
+        Constants.easConfig?.projectId;
+    if (!projectId) return false;
+
+    let freshToken: string | null = null;
+    try {
+        const Notifications = await getNotificationsModule();
+        const { status } = await Notifications.getPermissionsAsync();
+        if (status !== 'granted') return false;
+        const tokenObj = await Notifications.getExpoPushTokenAsync({ projectId });
+        freshToken = tokenObj.data;
+    } catch (err) {
+        // Fall back to cached token — better stale than nothing.
+        const cached = await getPushToken();
+        if (!cached) return false;
+        freshToken = cached;
+    }
+
+    if (!freshToken) return false;
+
+    const cached = await getPushToken();
+    if (cached !== freshToken) {
+        console.log('[Push] Token rotated — updating cache + backend');
+        await setPushToken(freshToken);
+    }
+
+    try {
+        await registerDeviceToken(freshToken, Platform.OS === 'android' ? 'android' : 'ios');
+        return true;
+    } catch (err) {
+        console.warn('[Push] Failed to sync token with backend:', err);
+        return false;
+    }
 }
 
 export function addNotificationResponseListener(

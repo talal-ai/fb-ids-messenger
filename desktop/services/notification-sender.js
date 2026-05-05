@@ -4,22 +4,90 @@
  * Primary:  Expo Push (mobile app)
  * Fallback: Telegram bot (if telegram_fallback_enabled setting is true)
  *
- * This module is wired into NotificationOutbox.setSender() in main.js.
+ * Wired into NotificationOutbox.setSender() in main.js.
+ *
+ * Receipt-driven token GC:
+ *   3s after every successful send, we poll the receipts. On DeviceNotRegistered,
+ *   the corresponding row in device_tokens is deleted so the next push doesn't
+ *   waste a network call. Other errors are logged but kept (could be transient).
  */
 
-const { sendExpoPush } = require('./expo-push');
+const { sendExpoPush, getExpoPushReceipts } = require('./expo-push');
 const Database = require('../db/database');
+
+const RECEIPT_POLL_DELAY_MS = 3_000;
 
 let _telegramSender = null;
 let _store = null;
 
-/**
- * Inject optional dependencies.
- * @param {{ telegramSender?: Function, store?: import('electron-store') }} deps
- */
 function init(deps) {
     if (deps.telegramSender) _telegramSender = deps.telegramSender;
     if (deps.store) _store = deps.store;
+}
+
+function deleteDeadToken(token) {
+    try {
+        const db = Database.getDb();
+        const r = db.prepare('DELETE FROM device_tokens WHERE token = ?').run(token);
+        if (r.changes > 0) {
+            console.warn(`[NotifSender] Removed dead token (DeviceNotRegistered): ${token.slice(0, 24)}...`);
+        }
+    } catch (err) {
+        console.error('[NotifSender] Failed to delete dead token:', err.message);
+    }
+}
+
+/**
+ * Schedule a receipt poll for a set of tickets emitted by sendExpoPush.
+ * Logs each non-ok receipt with full FCM error details. Deletes dead tokens.
+ */
+function scheduleReceiptPoll(tickets) {
+    const trackable = (tickets || []).filter((t) => t.ticket && t.ticket.status === 'ok' && t.ticket.id);
+    if (trackable.length === 0) {
+        // Log inline ticket errors (rejected at queue time, never get a receipt)
+        for (const t of (tickets || [])) {
+            if (t.ticket && t.ticket.status === 'error') {
+                console.error(
+                    `[NotifSender] Ticket error for ${t.token.slice(0, 24)}...: ${t.ticket.message || ''} ${JSON.stringify(t.ticket.details || {})}`
+                );
+                if (t.ticket.details && t.ticket.details.error === 'DeviceNotRegistered') {
+                    deleteDeadToken(t.token);
+                }
+            }
+        }
+        return;
+    }
+
+    const idToToken = new Map(trackable.map((t) => [t.ticket.id, t.token]));
+
+    setTimeout(async () => {
+        try {
+            const { ok, receipts, error } = await getExpoPushReceipts([...idToToken.keys()]);
+            if (!ok) {
+                console.error(`[NotifSender] Receipt poll failed: ${error}`);
+                return;
+            }
+            for (const [ticketId, token] of idToToken) {
+                const r = receipts[ticketId];
+                if (!r) continue; // still pending on Expo's side
+                if (r.status === 'ok') continue;
+
+                const errCode = (r.details && r.details.error) || 'unknown';
+                console.error(
+                    `[NotifSender] Receipt error [${errCode}] for ${token.slice(0, 24)}...: ${r.message || ''}`
+                );
+
+                if (errCode === 'DeviceNotRegistered') {
+                    deleteDeadToken(token);
+                }
+                // Other errors (MessageRateExceeded, MismatchSenderId, MessageTooBig,
+                // InvalidCredentials) are logged but the token is kept — these are
+                // sender-side problems, not token-side.
+            }
+        } catch (err) {
+            console.error('[NotifSender] Receipt poll exception:', err.message);
+        }
+    }, RECEIPT_POLL_DELAY_MS);
 }
 
 /**
@@ -44,6 +112,8 @@ async function send(notifData, context) {
                 title: accountLabel || accountId,
                 body: `${senderName}: ${body}`,
                 sound: 'default',
+                channelId: 'default',
+                priority: 'high',
                 data: {
                     accountId,
                     conversationId,
@@ -53,10 +123,14 @@ async function send(notifData, context) {
             });
             expoPushOk = result.ok;
             if (result.ok) {
-                console.log(`[NotifSender] Expo push sent to ${tokens.length} device(s)`);
+                console.log(`[NotifSender] Expo push queued for ${tokens.length} device(s)`);
             } else {
-                console.warn(`[NotifSender] Expo push failed: ${result.error || JSON.stringify(result.results)}`);
+                console.warn(
+                    `[NotifSender] Expo push failed: ${result.error || JSON.stringify(result.results)}`
+                );
             }
+            // Always poll receipts — this is where FCM/APNs failures surface.
+            scheduleReceiptPoll(result.tickets);
         } else {
             console.log('[NotifSender] No device tokens registered — skipping Expo push');
         }
@@ -77,7 +151,6 @@ async function send(notifData, context) {
         }
     }
 
-    // Success if either channel delivered
     return {
         ok: expoPushOk || !!telegramMsgId,
         telegramMsgId: telegramMsgId || null,

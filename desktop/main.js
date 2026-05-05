@@ -8,6 +8,13 @@ const store = new Store();
 // Set a friendly application name (affects menu on macOS, window title fallback etc.)
 app.name = 'Multi FB Manager';
 
+// Windows: ensure the running window's taskbar icon matches the installed
+// shortcut. Must equal the NSIS shortcut AppUserModelID, which electron-builder
+// derives from `build.appId` in package.json.
+if (process.platform === 'win32') {
+    app.setAppUserModelId('com.multi-fb.manager');
+}
+
 // Services
 const Database = require('./db/database');
 const PlaywrightManager = require('./services/playwright-manager');
@@ -18,12 +25,14 @@ const PollScheduler = require('./services/poll-scheduler');
 const NotificationOutbox = require('./services/notification-outbox');
 const NotificationSender = require('./services/notification-sender');
 const ReplyService = require('./services/reply-service');
+const CloudflaredManager = require('./services/cloudflared-manager');
 const controlPlane = require('../control-plane');
 
 let mainWindow;
 let controlPlaneServer = null;
 let updaterInitialized = false;
 let updaterEnabled = false;
+let cloudTunnelUrl = null;
 let updaterState = {
     status: 'idle',
     message: 'Idle',
@@ -32,6 +41,27 @@ let updaterState = {
     checkedAt: null,
     error: null
 };
+
+function mapUpdaterError(err) {
+    const rawMessage = err?.message || String(err || 'Unknown updater error');
+
+    if (
+        rawMessage.includes('Unable to find latest version on GitHub') ||
+        rawMessage.includes('Cannot parse releases feed')
+    ) {
+        return {
+            status: 'misconfigured',
+            message: 'Updater feed is not published yet',
+            error: 'Publish a production GitHub Release (with latest.yml assets) or disable auto-updates for this build.'
+        };
+    }
+
+    return {
+        status: 'error',
+        message: 'Update check failed',
+        error: rawMessage
+    };
+}
 
 function publishUpdaterState(partialState) {
     updaterState = {
@@ -81,7 +111,7 @@ function createWindow(isDev) {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
-    icon: path.join(__dirname, '../icon.png'),
+    icon: path.join(__dirname, '..', process.platform === 'win32' ? 'logo.ico' : 'icon.png'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -132,7 +162,7 @@ function setupAutoUpdater() {
         log.info('[Updater] Update available', info);
         publishUpdaterState({
                 status: 'available',
-                message: `New version ${info.version} is available`,
+                message: `Newer version v${info.version} found`,
                 updateInfo: info,
                 progress: null,
                 error: null,
@@ -143,7 +173,7 @@ function setupAutoUpdater() {
         log.info('[Updater] No update available', info);
         publishUpdaterState({
                 status: 'not-available',
-                message: 'You are up to date',
+                message: `Version v${app.getVersion()} already installed (up to date)`,
                 updateInfo: info || null,
                 progress: null,
                 error: null,
@@ -174,11 +204,7 @@ function setupAutoUpdater() {
   });
     autoUpdater.on('error', (err) => {
         log.error('[Updater] Error', err);
-        publishUpdaterState({
-                status: 'error',
-                message: 'Update check failed',
-                error: err?.message || String(err)
-        });
+        publishUpdaterState(mapUpdaterError(err));
     });
 }
 
@@ -189,7 +215,20 @@ app.whenReady().then(() => {
     if (!isDev) {
             updaterEnabled = true;
       setupAutoUpdater();
-      autoUpdater.checkForUpdatesAndNotify();
+
+            const runUpdateCheck = () => {
+                    autoUpdater.checkForUpdates().catch((err) => {
+                            log.error('[Updater] Background check failed', err);
+                            publishUpdaterState(mapUpdaterError(err));
+                    });
+            };
+
+            // Initial check ~10s after launch — lets the renderer mount and subscribe
+            // to updater:state first so the very first event is not lost.
+            setTimeout(runUpdateCheck, 10_000);
+
+            // Re-check every 30 minutes for long-running sessions.
+            setInterval(runUpdateCheck, 30 * 60 * 1000);
     }
 
     // Wire MessageMonitor to mainWindow + Telegram
@@ -722,11 +761,7 @@ ipcMain.handle('updater:check', async () => {
     try {
         await autoUpdater.checkForUpdates();
     } catch (err) {
-        publishUpdaterState({
-            status: 'error',
-            message: 'Update check failed',
-            error: err?.message || String(err)
-        });
+        publishUpdaterState(mapUpdaterError(err));
     }
     return updaterState;
 });
@@ -763,4 +798,82 @@ ipcMain.handle('updater:install', () => {
     }
     autoUpdater.quitAndInstall(false, true);
     return { ok: true };
+});
+
+// ============================================================================
+// Cloud Access (Cloudflare Tunnel) — One-click public URL
+// ============================================================================
+
+ipcMain.handle('cloud:get-status', () => {
+    const status = CloudflaredManager.getStatus();
+    return {
+        running: status.running,
+        url: status.url,
+        localPort: store.get('control_plane_http_port') || 3847
+    };
+});
+
+ipcMain.handle('cloud:enable', async () => {
+    const localPort = store.get('control_plane_http_port') || 3847;
+    
+    // Ensure control plane is running
+    if (!controlPlaneServer) {
+        const cpToken = (store.get('control_plane_token') || '').trim();
+        if (!cpToken) {
+            return { success: false, error: 'Set Control Plane Token in Settings first' };
+        }
+        controlPlaneServer = controlPlane.startHttpServer({
+            port: localPort,
+            token: cpToken,
+            getDb: () => Database.getDb(),
+            queueReplyFromCommand: (opts) => ReplyService.queueReplyFromCommand(opts),
+            syncConversation: async (accountId, conversationId) => {
+                try {
+                    const messages = await PlaywrightManager.fetchHistory(accountId, conversationId);
+                    const db = Database.getDb();
+                    const tx = db.transaction((msgs) => {
+                        for (const m of msgs) {
+                            const id = `msg_sync_${conversationId}_${m.timestamp}_${Math.random().toString(36).substring(2, 6)}`;
+                            db.prepare(`
+                                INSERT OR IGNORE INTO messages (id, conversation_id, account_id, sender_name, body, timestamp, is_outgoing)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            `).run(id, conversationId, accountId, m.senderName, m.body, m.timestamp, m.isOutgoing ? 1 : 0);
+                        }
+                    });
+                    tx(messages);
+                    return { ok: true, count: messages.length };
+                } catch (err) {
+                    return { ok: false, error: err.message };
+                }
+            }
+        });
+    }
+    
+    const result = await CloudflaredManager.quickConnect(localPort, (step, message) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('cloud:progress', { step, message });
+        }
+    });
+    if (result.success && typeof result.url === 'string' && result.url.trim()) {
+        cloudTunnelUrl = result.url;
+        // Auto-save the URL to clipboard for easy sharing
+        const { clipboard } = require('electron');
+        clipboard.writeText(result.url);
+    } else if (result.success) {
+        return {
+            success: false,
+            error: 'Tunnel started but no public URL was returned. Please try again.'
+        };
+    }
+    return result;
+});
+
+ipcMain.handle('cloud:disable', async () => {
+    await CloudflaredManager.stop();
+    cloudTunnelUrl = null;
+    return { success: true };
+});
+
+ipcMain.handle('cloud:get-url', () => {
+    return { url: CloudflaredManager.getStatus().url };
 });

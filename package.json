@@ -1,6 +1,6 @@
 {
   "name": "multi-fb-manager",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "Multi‑FB Manager – desktop controller for Facebook multi‑account sessions",
   "productName": "Multi FB Manager",
   "main": "desktop/main.js",
@@ -10,7 +10,7 @@
     "dev": "concurrently \"npm:vite\" \"npm:start\"",
     "vite": "vite",
     "build": "vite build",
-    "postinstall": "npx playwright install chromium && npx @electron/rebuild -f -w better-sqlite3",
+    "postinstall": "node scripts/postinstall.js",
     "package": "vite build && electron-builder",
     "package:win": "vite build && electron-builder --win",
     "package:mac": "vite build && electron-builder --mac",
@@ -19,7 +19,7 @@
   },
   "keywords": [
     "facebook",
-    "multi",
+    "version": "1.0.3",
     "account",
     "manager"
   ],
@@ -35,12 +35,14 @@
     "jest": "^30.2.0",
     "nodemon": "^3.1.11",
     "postcss": "^8.5.6",
+    "rcedit": "^4.0.1",
     "tailwindcss": "^4.1.18",
     "vite": "^7.3.1"
   },
   "build": {
     "appId": "com.multi-fb.manager",
     "productName": "Multi FB Manager",
+    "afterPack": "./scripts/embed-windows-icon.js",
     "publish": [
       {
         "provider": "github",
@@ -70,7 +72,8 @@
     },
     "win": {
       "target": "nsis",
-      "icon": "logo.ico"
+      "icon": "logo.ico",
+      "signAndEditExecutable": false
     },
     "mac": {
       "target": "dmg",

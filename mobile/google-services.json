@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "175909092373",
+    "project_id": "fbmanager-mobile",
+    "storage_bucket": "fbmanager-mobile.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:175909092373:android:df694e07f176346a59e21c",
+        "android_client_info": {
+          "package_name": "com.fbmanager.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCjd9Jov_2U3xdBKEfjBNjlaEC1ppDctQ4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

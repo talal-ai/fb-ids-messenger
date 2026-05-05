@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DEFAULT_SERVER_URL, DEFAULT_API_TOKEN } from './client-config';
 
 const KEYS = {
     SERVER_URL: 'server_url',
@@ -7,7 +8,8 @@ const KEYS = {
 };
 
 export async function getServerUrl(): Promise<string> {
-    return (await AsyncStorage.getItem(KEYS.SERVER_URL)) || '';
+    const saved = await AsyncStorage.getItem(KEYS.SERVER_URL);
+    return saved || DEFAULT_SERVER_URL || '';
 }
 
 export async function setServerUrl(url: string): Promise<void> {
@@ -15,7 +17,8 @@ export async function setServerUrl(url: string): Promise<void> {
 }
 
 export async function getApiToken(): Promise<string> {
-    return (await AsyncStorage.getItem(KEYS.API_TOKEN)) || '';
+    const saved = await AsyncStorage.getItem(KEYS.API_TOKEN);
+    return saved || DEFAULT_API_TOKEN || '';
 }
 
 export async function setApiToken(token: string): Promise<void> {

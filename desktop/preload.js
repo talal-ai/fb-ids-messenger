@@ -44,5 +44,16 @@ contextBridge.exposeInMainWorld('api', {
         const listener = (_event, status) => callback(status);
         ipcRenderer.on('control-plane:status', listener);
         return () => ipcRenderer.removeListener('control-plane:status', listener);
+    },
+
+    // Cloud Access (Cloudflare Tunnel)
+    getCloudStatus: () => ipcRenderer.invoke('cloud:get-status'),
+    enableCloud: () => ipcRenderer.invoke('cloud:enable'),
+    disableCloud: () => ipcRenderer.invoke('cloud:disable'),
+    getCloudUrl: () => ipcRenderer.invoke('cloud:get-url'),
+    onCloudProgress: (callback) => {
+        const listener = (_event, payload) => callback(payload);
+        ipcRenderer.on('cloud:progress', listener);
+        return () => ipcRenderer.removeListener('cloud:progress', listener);
     }
 });

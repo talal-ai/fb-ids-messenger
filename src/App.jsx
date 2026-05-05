@@ -1,10 +1,11 @@
 
 import React, { useState, useEffect } from 'react';
-import { Activity, Users, Smartphone, RefreshCw, Download, RotateCcw } from 'lucide-react';
+import { Activity, Users, Smartphone, RefreshCw, Download, RotateCcw, Globe } from 'lucide-react';
 import Logo from './components/Logo';
 import Dashboard from './components/Dashboard';
 import ActiveAccounts from './components/ActiveAccounts';
 import TelegramSettings from './components/TelegramSettings';
+import CloudAccess from './components/CloudAccess';
 
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -103,7 +104,22 @@ function App() {
   const isDownloading = updater.status === 'downloading';
   const canDownload = updater.status === 'available';
   const canRestart = updater.status === 'downloaded';
+  const isUpToDate = updater.status === 'not-available';
   const progressPercent = Number.isFinite(updater.progress?.percent) ? updater.progress.percent : 0;
+
+  const statusToneClass =
+    canDownload || canRestart
+      ? 'text-blue-300'
+      : isUpToDate
+      ? 'text-emerald-400'
+      : updater.status === 'error'
+      ? 'text-rose-400'
+      : 'text-slate-400';
+
+  // Hide dev-facing "feed not published yet" state from end users — keep it
+  // logged via electron-log but render the footer as a neutral idle state.
+  const displayMessage =
+    updater.status === 'misconfigured' ? 'Idle' : updater.message || 'Idle';
 
   const handleCheckUpdates = async () => {
     if (!window.api) return;
@@ -142,9 +158,10 @@ function App() {
 
           <nav className="flex-1 p-3 space-y-1 min-h-0 overflow-y-auto">
             {[
-              { id: 'dashboard', label: 'Dashboard', icon: Activity },
+{ id: 'dashboard', label: 'Dashboard', icon: Activity },
               { id: 'accounts', label: 'Active Sessions', icon: Users },
-              { id: 'settings', label: 'Telegram Setup', icon: Smartphone },
+              { id: 'cloud', label: 'Cloud Access', icon: Globe },
+              { id: 'settings', label: 'API Settings', icon: Smartphone },
             ].map((item) => (
               <button
                 key={item.id}
@@ -194,7 +211,7 @@ function App() {
         <header className="h-16 shrink-0 flex items-center justify-between px-6 mb-4 rounded-2xl bg-slate-900/40 backdrop-blur-xl border border-white/[0.06] shadow-glass mx-2">
           <div className="min-w-0">
             <h2 className="text-xl font-semibold text-white tracking-tight truncate">
-              {activeTab === 'dashboard' ? 'Overview' : activeTab === 'accounts' ? 'Session Manager' : activeTab === 'settings' ? 'Telegram Configuration' : ''}
+{activeTab === 'dashboard' ? 'Overview' : activeTab === 'accounts' ? 'Session Manager' : activeTab === 'cloud' ? 'Cloud Access' : activeTab === 'settings' ? 'API & Telegram Setup' : ''}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">Manage your automated FB environment</p>
           </div>
@@ -225,6 +242,7 @@ function App() {
             />
           )}
           {activeTab === 'settings' && <TelegramSettings />}
+          {activeTab === 'cloud' && <CloudAccess />}
         </main>
 
         <footer className="mx-2 mt-2 shrink-0 rounded-2xl bg-slate-900/40 backdrop-blur-xl border border-white/[0.06] shadow-glass px-4 py-3">
@@ -232,7 +250,7 @@ function App() {
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <p className="text-xs font-medium text-slate-200 truncate">Updater</p>
-                <p className="text-[11px] text-slate-400 truncate">{updater.message || 'Idle'}</p>
+                <p className={`text-[11px] truncate ${statusToneClass}`}>{displayMessage}</p>
               </div>
 
               <div className="flex items-center gap-2 shrink-0">

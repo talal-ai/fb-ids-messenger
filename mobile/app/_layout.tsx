@@ -1,7 +1,12 @@
 import { useEffect } from 'react';
 import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { setupPushNotifications, addNotificationResponseListener } from '@/lib/notifications';
+import { AppState } from 'react-native';
+import {
+    setupPushNotifications,
+    syncPushTokenWithBackend,
+    addNotificationResponseListener,
+} from '@/lib/notifications';
 import { setCachedSenderName, getServerUrl, setServerUrl, getApiToken, setApiToken } from '@/lib/storage';
 import { DEFAULT_SERVER_URL, DEFAULT_API_TOKEN } from '@/lib/client-config';
 
@@ -23,11 +28,24 @@ export default function RootLayout() {
     const router = useRouter();
 
     useEffect(() => {
-        applyDefaultConfigIfNeeded().catch(() => {});
+        const initialize = async () => {
+            try {
+                await applyDefaultConfigIfNeeded();
+                await setupPushNotifications();
+                await syncPushTokenWithBackend();
+            } catch (e) {
+                console.warn('[Push] Startup setup failed:', e);
+            }
+        };
+        initialize().catch(() => {});
 
-        setupPushNotifications().catch((e) =>
-            console.warn('[Push] Setup failed:', e)
-        );
+        const appStateSub = AppState.addEventListener('change', (nextState) => {
+            if (nextState === 'active') {
+                syncPushTokenWithBackend().catch((e) => {
+                    console.warn('[Push] Foreground re-sync failed:', e);
+                });
+            }
+        });
 
         const subscription = addNotificationResponseListener((response) => {
             const data = response.notification.request.content.data;
@@ -47,7 +65,10 @@ export default function RootLayout() {
             }
         });
 
-        return () => subscription.remove();
+        return () => {
+            subscription.remove();
+            appStateSub.remove();
+        };
     }, []);
 
     return (
