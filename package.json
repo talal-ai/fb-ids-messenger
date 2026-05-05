@@ -1,6 +1,6 @@
 {
   "name": "multi-fb-manager",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Multi‑FB Manager – desktop controller for Facebook multi‑account sessions",
   "productName": "Multi FB Manager",
   "main": "desktop/main.js",

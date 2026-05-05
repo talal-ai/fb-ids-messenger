@@ -112,14 +112,11 @@ function App() {
       ? 'text-blue-300'
       : isUpToDate
       ? 'text-emerald-400'
-      : updater.status === 'error'
+      : updater.status === 'error' || updater.status === 'misconfigured'
       ? 'text-rose-400'
       : 'text-slate-400';
 
-  // Hide dev-facing "feed not published yet" state from end users — keep it
-  // logged via electron-log but render the footer as a neutral idle state.
-  const displayMessage =
-    updater.status === 'misconfigured' ? 'Idle' : updater.message || 'Idle';
+  const displayMessage = updater.message || 'Idle';
 
   const handleCheckUpdates = async () => {
     if (!window.api) return;
