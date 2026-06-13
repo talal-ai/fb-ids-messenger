@@ -54,6 +54,7 @@
     "directories": {
       "output": "release"
     },
+    "artifactName": "Multi-FB-Manager-Setup-${version}.${ext}",
     "files": [
       "desktop/**",
       "control-plane/**",

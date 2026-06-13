@@ -24,6 +24,10 @@ jobs:
       - name: Build desktop installer
         run: npm run release
 
+      - name: List build artifacts
+        shell: pwsh
+        run: Get-ChildItem -Recurse release | Format-Table Name, Length -AutoSize
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
