@@ -12,14 +12,26 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
       - run: npm ci
-      - run: npm run release
+
+      - name: Build desktop installer
+        run: npm run release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/Multi-FB-Manager-Setup-*.exe
+            release/Multi-FB-Manager-Setup-*.exe.blockmap
+            release/latest.yml
+          generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

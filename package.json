@@ -15,7 +15,7 @@
     "package:win": "vite build && electron-builder --win",
     "package:mac": "vite build && electron-builder --mac",
     "package:linux": "vite build && electron-builder --linux",
-    "release": "npm run package && electron-builder --publish always"
+    "release": "npm run build && electron-builder --win --publish never"
   },
   "keywords": [
     "facebook",
