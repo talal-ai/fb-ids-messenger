@@ -25,8 +25,18 @@ const PollScheduler = require('./services/poll-scheduler');
 const NotificationOutbox = require('./services/notification-outbox');
 const NotificationSender = require('./services/notification-sender');
 const ReplyService = require('./services/reply-service');
-const CloudflaredManager = require('./services/cloudflared-manager');
+// Permanent reverse tunnel to our VPS (replaces ephemeral Cloudflare quick-tunnel).
+// Kept the CloudflaredManager name to minimise churn across the cloud:* handlers.
+const CloudflaredManager = require('./services/frpc-manager');
 const controlPlane = require('../control-plane');
+
+// Let the tunnel read VPS overrides (frp_server_addr, frp_token, …) from settings.
+CloudflaredManager.setConfigSource((key) => store.get(key));
+
+// Default control-plane Bearer token. Must match the mobile app's DEFAULT_API_TOKEN
+// (mobile/lib/client-config.ts) so the paired apps work out of the box. A token set
+// in Settings → Control Plane Token always overrides this.
+const DEFAULT_CONTROL_PLANE_TOKEN = '58649e16c9a9a50b17b49cd5cd90527c4575a73f9386c896';
 
 let mainWindow;
 let controlPlaneServer = null;
@@ -315,7 +325,7 @@ app.whenReady().then(() => {
     // Control-plane API (enabled by default — mobile app needs it)
     try {
         const cpDisabled = store.get('control_plane_http_disabled') === true;
-        const cpToken = (store.get('control_plane_token') || process.env.CONTROL_PLANE_TOKEN || '').trim();
+        const cpToken = (store.get('control_plane_token') || process.env.CONTROL_PLANE_TOKEN || DEFAULT_CONTROL_PLANE_TOKEN || '').trim();
         if (!cpDisabled && cpToken) {
             const cpPort = Number(store.get('control_plane_http_port') || process.env.CONTROL_PLANE_HTTP_PORT || 3847);
             controlPlaneServer = controlPlane.startHttpServer({
@@ -343,6 +353,24 @@ app.whenReady().then(() => {
                     }
                 }
             });
+
+            // Auto-start the permanent reverse tunnel so the mobile app can reach
+            // this PC on every launch — the operator never has to click "Enable".
+            // The public URL is fixed, so this re-establishes the SAME backend each time.
+            if (store.get('cloud_autostart') !== false) {
+                CloudflaredManager.quickConnect(cpPort, (step, message) => {
+                    if (mainWindow && !mainWindow.isDestroyed()) {
+                        mainWindow.webContents.send('cloud:progress', { step, message });
+                    }
+                }).then((res) => {
+                    if (res.success && res.url) {
+                        cloudTunnelUrl = res.url;
+                        console.log('[Tunnel] Auto-connected:', res.url);
+                    } else {
+                        console.warn('[Tunnel] Auto-connect failed:', res.error);
+                    }
+                }).catch((e) => console.warn('[Tunnel] Auto-connect error:', e.message));
+            }
         } else if (!cpToken) {
             console.log(
                 '[ControlPlane] HTTP not started — set control_plane_token in settings or CONTROL_PLANE_TOKEN env var.'
@@ -358,6 +386,10 @@ app.whenReady().then(() => {
 app.on('window-all-closed', async () => {
     PollScheduler.stop();
     NotificationOutbox.stop();
+    // Tear down the reverse tunnel so the server frees our proxy slot immediately.
+    // Without this, frpc can be orphaned on Windows and keep holding the slot,
+    // making the next launch fail with "proxy already exists".
+    try { await CloudflaredManager.stop(); } catch (_) {}
     if (controlPlaneServer) {
         try {
             controlPlaneServer.close();
@@ -366,6 +398,12 @@ app.on('window-all-closed', async () => {
     }
     await PlaywrightManager.closeAll();
     if (process.platform !== 'darwin') app.quit();
+});
+
+// Belt-and-suspenders: also stop the tunnel on quit paths that bypass
+// window-all-closed (e.g. app relaunch, Cmd-Q on macOS).
+app.on('before-quit', () => {
+    try { CloudflaredManager.stop(); } catch (_) {}
 });
 
 // ============================================================================
@@ -801,7 +839,7 @@ ipcMain.handle('updater:install', () => {
 });
 
 // ============================================================================
-// Cloud Access (Cloudflare Tunnel) — One-click public URL
+// Cloud Access (permanent FRP reverse tunnel to VPS) — fixed public URL
 // ============================================================================
 
 ipcMain.handle('cloud:get-status', () => {
@@ -818,7 +856,7 @@ ipcMain.handle('cloud:enable', async () => {
     
     // Ensure control plane is running
     if (!controlPlaneServer) {
-        const cpToken = (store.get('control_plane_token') || '').trim();
+        const cpToken = (store.get('control_plane_token') || DEFAULT_CONTROL_PLANE_TOKEN || '').trim();
         if (!cpToken) {
             return { success: false, error: 'Set Control Plane Token in Settings first' };
         }

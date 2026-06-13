@@ -136,7 +136,7 @@ export default function SettingsScreen() {
                 style={styles.input}
                 value={url}
                 onChangeText={(v) => { setUrl(v); setStatus('idle'); }}
-                placeholder="https://fbmgr-xxxx.trycloudflare.com"
+                placeholder="https://multi-messenger.gadgetronics.pk"
                 placeholderTextColor="#9CA3AF"
                 autoCapitalize="none"
                 autoCorrect={false}

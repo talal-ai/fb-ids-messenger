@@ -1,6 +1,13 @@
 import { getServerUrl, getApiToken } from './storage';
 import type { Account, Conversation, Message, ReplyCommand } from './types';
 
+// Statuses that mean "tunnel/proxy momentarily unavailable" — safe to retry.
+const TRANSIENT_STATUS = new Set([502, 503, 504]);
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 600;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const baseUrl = await getServerUrl();
     const token = await getApiToken();
@@ -8,20 +15,52 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     if (!baseUrl) throw new Error('Server URL not configured');
     if (!token) throw new Error('API token not configured');
 
-    const res = await fetch(`${baseUrl}${path}`, {
-        method,
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-        },
-        body: body ? JSON.stringify(body) : undefined,
-    });
+    let lastErr: Error = new Error('Request failed');
 
-    const json = await res.json();
-    if (!res.ok && !json.ok) {
-        throw new Error(json.detail || json.code || `HTTP ${res.status}`);
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        let res: Response;
+        try {
+            res = await fetch(`${baseUrl}${path}`, {
+                method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: body ? JSON.stringify(body) : undefined,
+            });
+        } catch (e: any) {
+            // Network-level failure (tunnel resetting connection). Retry.
+            lastErr = new Error('Connection lost — retrying…');
+            if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
+            throw lastErr;
+        }
+
+        // Tunnel mid-reconnect → Apache serves a 502/503 HTML page. Retry quietly.
+        if (TRANSIENT_STATUS.has(res.status)) {
+            lastErr = new Error('Server reconnecting — please retry');
+            if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
+            throw lastErr;
+        }
+
+        // Parse defensively: never let res.json() throw a raw "Unexpected token <".
+        const text = await res.text();
+        let json: any;
+        try {
+            json = text ? JSON.parse(text) : {};
+        } catch {
+            // Got HTML/non-JSON (proxy error page, gateway, etc.).
+            lastErr = new Error('Server busy — please retry');
+            if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
+            throw lastErr;
+        }
+
+        if (!res.ok && !json.ok) {
+            throw new Error(json.detail || json.code || `HTTP ${res.status}`);
+        }
+        return json as T;
     }
-    return json as T;
+
+    throw lastErr;
 }
 
 export async function fetchAccounts(): Promise<Account[]> {
@@ -69,7 +108,8 @@ export async function testConnection(): Promise<boolean> {
     try {
         const baseUrl = await getServerUrl();
         const res = await fetch(`${baseUrl}/health`);
-        const json = await res.json();
+        const text = await res.text();
+        const json = JSON.parse(text);
         return json.ok === true;
     } catch {
         return false;

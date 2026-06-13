@@ -1,0 +1,14 @@
+serverAddr = "5.189.174.219"
+serverPort = 7000
+auth.method = "token"
+auth.token = "78ea2ed625f3a3cac10daad57650f349950a5f7eacb02095"
+loginFailExit = false
+
+[[proxies]]
+name = "messenger"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3847
+remotePort = 8788
+transport.useEncryption = true
+transport.useCompression = true

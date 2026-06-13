@@ -11,7 +11,12 @@
  *   Fill these BEFORE building, then build & distribute.
  */
 
-const DEFAULT_SERVER_URL = '';  // e.g. 'https://fbmgr-abc.trycloudflare.com'
-const DEFAULT_API_TOKEN  = '';  // e.g. 'your-secret-token'
+// Permanent backend on our VPS (multi-messenger.gadgetronics.pk).
+// This URL never changes — the desktop app opens a reverse tunnel to it on launch,
+// so the mobile app is configured once and survives every desktop restart.
+const DEFAULT_SERVER_URL = 'https://multi-messenger.gadgetronics.pk';
+
+// Must match the desktop app's Settings → Control Plane Token (set once, never changes).
+const DEFAULT_API_TOKEN  = '58649e16c9a9a50b17b49cd5cd90527c4575a73f9386c896';
 
 export { DEFAULT_SERVER_URL, DEFAULT_API_TOKEN };

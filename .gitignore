@@ -11,10 +11,13 @@ mobile/dist/
 mobile/ios/
 mobile/android/
 
-# FCM V1 service account key (private credential — DO NOT COMMIT)
+.expo/ (private credential — DO NOT COMMIT)
 mobile/fcm-service-account.json
 mobile/*-service-account*.json
 
 # Build artifacts (downloaded APKs, etc.)
 *.apk
 *.aab
+
+# Local tunnel test scratch
+.tmp-tunnel-test/

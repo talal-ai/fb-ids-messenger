@@ -2,7 +2,7 @@
   "expo": {
     "name": "FB Manager Mobile",
     "slug": "multi-fb-manager",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "extra": {
       "eas": {
         "projectId": "dbf07a4f-696e-4cad-882f-94aa19835940"
@@ -20,7 +20,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.fbmanager.mobile",
-      "buildNumber": "2",
+      "buildNumber": "3",
       "supportsTablet": true,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
@@ -33,7 +33,7 @@
         "backgroundColor": "#ffffff"
       },
       "package": "com.fbmanager.mobile",
-      "versionCode": 2,
+      "versionCode": 3,
       "softwareKeyboardLayoutMode": "pan"
     },
     "plugins": [

@@ -46,7 +46,7 @@ contextBridge.exposeInMainWorld('api', {
         return () => ipcRenderer.removeListener('control-plane:status', listener);
     },
 
-    // Cloud Access (Cloudflare Tunnel)
+    // Cloud Access (permanent FRP reverse tunnel to VPS)
     getCloudStatus: () => ipcRenderer.invoke('cloud:get-status'),
     enableCloud: () => ipcRenderer.invoke('cloud:enable'),
     disableCloud: () => ipcRenderer.invoke('cloud:disable'),

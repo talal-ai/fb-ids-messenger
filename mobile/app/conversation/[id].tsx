@@ -12,6 +12,7 @@ import {
     StyleSheet,
     Keyboard,
     Animated,
+    Dimensions,
 } from 'react-native';
 import { useLocalSearchParams, useNavigation } from 'expo-router';
 import { useFocusEffect } from 'expo-router';
@@ -56,18 +57,23 @@ function getDateLabel(ts: number): string {
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
+// Cap header text width so long names ellipsize instead of running off-screen.
+// Leave room for the back button + any header buttons on both sides.
+const HEADER_MAX_W = Math.min(Dimensions.get('window').width - 140, 260);
+
 function HeaderTitle({ title, subtitle }: { title: string; subtitle: string }) {
     return (
-        <View style={{ alignItems: 'center' }}>
-            <Text style={hdrStyles.name} numberOfLines={1}>{title}</Text>
-            {!!subtitle && <Text style={hdrStyles.sub} numberOfLines={1}>{subtitle}</Text>}
+        <View style={hdrStyles.wrap}>
+            <Text style={hdrStyles.name} numberOfLines={1} ellipsizeMode="tail">{title}</Text>
+            {!!subtitle && <Text style={hdrStyles.sub} numberOfLines={1} ellipsizeMode="tail">{subtitle}</Text>}
         </View>
     );
 }
 
 const hdrStyles = StyleSheet.create({
-    name: { fontSize: 16, fontWeight: '700', color: '#111827' },
-    sub: { fontSize: 11, color: '#6366F1', marginTop: 1 },
+    wrap: { alignItems: 'center', justifyContent: 'center', maxWidth: HEADER_MAX_W },
+    name: { fontSize: 16, fontWeight: '700', color: '#111827', maxWidth: HEADER_MAX_W },
+    sub: { fontSize: 11, color: '#6366F1', marginTop: 1, maxWidth: HEADER_MAX_W },
 });
 
 function DateSeparator({ label }: { label: string }) {
@@ -93,8 +99,26 @@ function MessageBubble({
 }) {
     const isOut = item.is_outgoing === 1;
 
+    // Subtle entrance: fade + slide up. Fires once per mount (new message key).
+    const anim = useRef(new Animated.Value(0)).current;
+    useEffect(() => {
+        Animated.timing(anim, {
+            toValue: 1,
+            duration: 220,
+            useNativeDriver: true,
+        }).start();
+    }, [anim]);
+
+    const animStyle = {
+        opacity: anim,
+        transform: [
+            { translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
+            { scale: anim.interpolate({ inputRange: [0, 1], outputRange: [0.97, 1] }) },
+        ],
+    };
+
     return (
-        <View style={[styles.msgRow, isOut ? styles.msgRowOut : styles.msgRowIn]}>
+        <Animated.View style={[styles.msgRow, isOut ? styles.msgRowOut : styles.msgRowIn, animStyle]}>
             {/* Incoming avatar — hidden when grouped with next msg */}
             {!isOut && (
                 <View style={[styles.avatar, isGrouped && styles.avatarHidden]}>
@@ -130,13 +154,13 @@ function MessageBubble({
                         {formatTime(item.timestamp)}
                     </Text>
                     {isOut && (
-                        <Text style={styles.tickText}>
-                            {isPending ? '⏱' : '✓✓'}
+                        <Text style={[styles.tickText, !isPending && styles.tickRead]}>
+                            {isPending ? '🕓' : '✓✓'}
                         </Text>
                     )}
                 </View>
             </View>
-        </View>
+        </Animated.View>
     );
 }
 
@@ -201,9 +225,11 @@ export default function ConversationScreen() {
             const subtitle = accountLabel ? `via ${accountLabel}` : '';
 
             navigation.setOptions({
+                headerTitleAlign: 'center',
+                headerBackTitleVisible: false,
                 headerTitle: subtitle
                     ? () => <HeaderTitle title={title} subtitle={subtitle} />
-                    : title,
+                    : () => <HeaderTitle title={title} subtitle="" />,
             });
 
             const load = async () => {
@@ -542,6 +568,7 @@ const styles = StyleSheet.create({
     timeText: { fontSize: 10, color: '#9CA3AF' },
     timeTextOut: { color: 'rgba(255,255,255,0.55)' },
     tickText: { fontSize: 10, color: 'rgba(255,255,255,0.65)' },
+    tickRead: { color: '#A7F3D0' },
 
     // Input bar
     inputBar: {
